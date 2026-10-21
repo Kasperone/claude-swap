@@ -59,13 +59,13 @@ class RealKeychain(FakeKeychain):
 
 @pytest.fixture
 def keychain(monkeypatch) -> RealKeychain:
+    monkeypatch.setenv("CSWAP_REAL_HOME", REAL_HOME)
     default = subprocess.run(
-        ["/usr/bin/security", "default-keychain"], capture_output=True, text=True
+        [str(REAL_SECURITY), "default-keychain"], capture_output=True, text=True
     ).stdout.strip().strip('"')
     assert Path(default).resolve() == Path(os.environ["CSWAP_CI_KEYCHAIN"]).resolve(), (
         "default keychain is not the CI throwaway one"
     )
-    monkeypatch.setenv("CSWAP_REAL_HOME", REAL_HOME)
     monkeypatch.setenv("USER", ACCOUNT)
     monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
     kc = RealKeychain()
