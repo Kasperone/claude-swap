@@ -50,7 +50,12 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.credentials import design_oauth_of, is_login_less, with_design_oauth
+from claude_swap.credentials import (
+    design_oauth_of,
+    is_login_less,
+    newer_design_oauth,
+    with_design_oauth,
+)
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -198,6 +203,23 @@ AUTH_OVERRIDE_ENV_VARS = (
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 )
 
+# Env vars that point Claude Code's credential store away from the profile.
+# CLAUDE_SECURESTORAGE_CONFIG_DIR, when defined (even empty), names the
+# secure-storage dir and Keychain item for EVERY key of the login blob
+# (2.1.306 ``TL()``/``RB()``), over CLAUDE_CONFIG_DIR: exported globally it
+# would make every session share the default store, claudeAiOauth and
+# designOauth included. Always removed from the session launch and probe env.
+STORAGE_OVERRIDE_ENV_VARS = ("CLAUDE_SECURESTORAGE_CONFIG_DIR",)
+
+
+def _session_env(session_dir: Path) -> dict[str, str]:
+    """Env for claude inside a session profile: the profile's own store only."""
+    dropped = AUTH_OVERRIDE_ENV_VARS + STORAGE_OVERRIDE_ENV_VARS
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
+    env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+    return env
+
+
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
 
@@ -273,6 +295,8 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
 def _profile_design_oauth(session_dir: Path) -> dict | None:
     """The profile's own ``designOauth``, from its hashed item(s) then its file.
 
+    Inside ``cswap run`` Claude Code keeps the session's Design login in the
+    profile's own store, so a ``/design-login`` there is this account's.
     Read raw, unlike :func:`read_config_dir_credentials`, which skips a
     login-less blob: a profile that holds only its Design login must keep it.
     The first existing item is authoritative (claude reads it before the
@@ -569,10 +593,8 @@ def _mkdir_private(path: Path) -> None:
 
 
 def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
-    env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
-    env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return env
+    """Env for the auth-status probe: the same profile env as the launch."""
+    return _session_env(session_dir)
 
 
 class SessionManager:
@@ -658,6 +680,13 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
+        redirected = [v for v in STORAGE_OVERRIDE_ENV_VARS if v in os.environ]
+        if redirected:
+            warning(
+                f"Ignoring {', '.join(redirected)} for this session — it would "
+                "make the session use another profile's credential store."
+            )
+
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
@@ -666,11 +695,7 @@ class SessionManager:
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
-        env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(claude_bin, claude_args, env=_session_env(session_dir))
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -911,8 +936,8 @@ class SessionManager:
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
         # The profile's own Claude Design login (designOauth) lives in the
-        # profile's store, not the backup: read it before the delete below
-        # removes the hashed item, and carry it into the seed.
+        # profile's store and may be newer than the backup's: read it before
+        # the delete below removes the hashed item.
         profile_design = _profile_design_oauth(session_dir)
 
         # Claude reads the keychain before the plaintext file — a stale hashed
@@ -936,8 +961,14 @@ class SessionManager:
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
 
-        if profile_design is not None:
-            creds = with_design_oauth(creds, profile_design)
+        # designOauth is account-owned and the backup holds only this
+        # account's own (a slot without one seeds none — never another
+        # account's). Of the two copies of this account's Design login, the
+        # later generation wins; the profile's on a tie, as before.
+        backup_design = design_oauth_of(creds)
+        design = newer_design_oauth(profile_design, backup_design)
+        if design != backup_design:
+            creds = with_design_oauth(creds, design)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is

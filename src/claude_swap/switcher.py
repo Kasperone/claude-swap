@@ -48,9 +48,13 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    design_fingerprint,
+    design_oauth_of,
     looks_like_api_key,
     merge_shared_credential_fields,
+    newer_design_oauth,
     shared_credential_fields,
+    with_design_oauth,
 )
 from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
@@ -2901,13 +2905,72 @@ class ClaudeAccountSwitcher:
                 return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
+                self._adopt_session_design(account_num, email, org_uuid)
                 return False
             if read_session_identity(session_dir) is None:
                 return None
+            # The profile's head may predate a Design login the backup got
+            # from the default store; keep the later generation of the two.
+            backup = self._store._read_account_credentials(account_num, email)
+            profile = with_design_oauth(
+                profile,
+                newer_design_oauth(design_oauth_of(profile), design_oauth_of(backup)),
+            )
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
+        )
+        return True
+
+    def _adopt_session_design(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool:
+        """Capture a quiescent profile's newer Design login into the slot backup.
+
+        ``/design-login`` inside ``cswap run`` writes ``designOauth`` into the
+        profile's own store and leaves the login itself alone, so the
+        generation check of :meth:`_adopt_session_credential` never sees it.
+        designOauth is account-owned: the profile's copy is this account's,
+        and it goes into this slot's backup only — never the default store or
+        another slot. Written when the backup has none or an older generation;
+        the backup's login is kept verbatim. Same evidence bar as the login
+        adoption (caller holds cswap's lock and checked quiescence): the
+        profile must be readable as this account and not stale-marked, and an
+        unreadable backup writes nothing. Returns whether it wrote.
+        """
+        from claude_swap.session import (
+            _profile_design_oauth,
+            is_session_stale,
+            read_session_identity,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        if is_session_stale(session_dir):
+            return False
+        profile_design = _profile_design_oauth(session_dir)
+        if profile_design is None:
+            return False
+        if read_session_identity(session_dir) is None or session_identity_drifted(
+            session_dir, email, org_uuid
+        ):
+            return False
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable or not backup:
+            return False
+        backup_design = design_oauth_of(backup)
+        if profile_design == backup_design:
+            return False
+        if newer_design_oauth(backup_design, profile_design) is not profile_design:
+            return False
+        updated = with_design_oauth(backup, profile_design)
+        if updated == backup:
+            return False  # not a Claude login: API-key slots own no Design login
+        self._store._write_account_credentials(account_num, email, updated)
+        self._logger.info(
+            f"Adopted account {account_num}'s session Design login "
+            f"({design_fingerprint(profile_design)}) into its backup"
         )
         return True
 

@@ -173,6 +173,169 @@ class TestSwitchMatrix:
         assert sw._read_account_credentials("4", "api-key-4@token.local") == API_KEY
 
 
+@pytest.fixture
+def run_env(linux, temp_home, monkeypatch):
+    """Account 1 is the default login with D1; account 2 has no Design login."""
+    sw = linux
+    _roster(sw, temp_home, {"1": _login("1", D1), "2": _login("2")}, active="1")
+    session_dir = session_dir_for(sw.backup_dir, "2", _email("2"))
+    return sw, session_dir
+
+
+def _bootstrap(sw: ClaudeAccountSwitcher, num: str) -> Path:
+    session_dir = session_dir_for(sw.backup_dir, num, _email(num))
+    SessionManager(sw)._bootstrap(session_dir, num, _email(num), "")
+    return session_dir
+
+
+def _profile_blob(session_dir: Path) -> dict:
+    return json.loads((session_dir / ".credentials.json").read_text())
+
+
+class TestSessions:
+    """``cswap run --require-session``: the profile keeps its own Design
+    login, is never seeded with another account's, and a /design-login there
+    goes into that account's slot only."""
+
+    def test_new_profile_gets_no_other_accounts_design(self, run_env, temp_home):
+        sw, _ = run_env
+        session_dir = _bootstrap(sw, "2")
+        assert "designOauth" not in _profile_blob(session_dir)
+        assert _design(_live_file(temp_home).read_text()) == D1
+
+    def test_new_profile_gets_its_own_slots_design(self, run_env):
+        sw, _ = run_env
+        sw._store._write_account_credentials("2", _email("2"), _login("2", D2))
+        assert _profile_blob(_bootstrap(sw, "2"))["designOauth"] == D2
+
+    def test_design_login_in_session_is_captured_into_its_slot_only(
+        self, run_env, temp_home
+    ):
+        sw, session_dir = run_env
+        _bootstrap(sw, "2")
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": _email("2"), "accountUuid": "u2"}
+        }))
+        default_before = _live_file(temp_home).read_text()
+        # /design-login inside the session: Claude Code writes the profile.
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": D2})
+        )
+
+        assert sw._adopt_session_credential("2", _email("2"), "") is False
+        assert _design(_backup(sw, "2")) == D2
+        assert json.loads(_backup(sw, "2"))["claudeAiOauth"] == blob["claudeAiOauth"]
+        assert _live_file(temp_home).read_text() == default_before
+        assert _design(_backup(sw, "1")) == D1
+
+        # Through the default and back: each account still has its own.
+        sw.switch_to("2", json_output=True)
+        assert _design(_live_file(temp_home).read_text()) == D2
+        sw.switch_to("1", json_output=True)
+        assert _design(_live_file(temp_home).read_text()) == D1
+        assert _design(_backup(sw, "2")) == D2
+
+    def test_rotated_profile_adoption_keeps_the_newer_design(self, run_env):
+        sw, session_dir = run_env
+        sw._store._write_account_credentials("2", _email("2"), _login("2", D2))
+        _bootstrap(sw, "2")
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": _email("2"), "accountUuid": "u2"}
+        }))
+        # The session refreshed its login; its profile lacks the newer Design
+        # login the backup got meanwhile.
+        newer = {**D2, "accessToken": "fake-d2-newer", "expiresAt": 9000}
+        rotated = json.loads(_login("2", expires=9000))
+        rotated["claudeAiOauth"]["refreshToken"] = "fake-login-2-rt-next"
+        (session_dir / ".credentials.json").write_text(json.dumps(rotated))
+        sw._store._write_account_credentials("2", _email("2"), _login("2", newer))
+
+        assert sw._adopt_session_credential("2", _email("2"), "") is True
+        stored = json.loads(_backup(sw, "2"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "fake-login-2-rt-next"
+        assert stored["designOauth"] == newer
+
+    def test_older_profile_design_is_not_adopted(self, run_env):
+        sw, session_dir = run_env
+        sw._store._write_account_credentials("2", _email("2"), _login("2", D2))
+        _bootstrap(sw, "2")
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": _email("2"), "accountUuid": "u2"}
+        }))
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": {**D2, "expiresAt": 1}})
+        )
+
+        assert sw._adopt_session_design("2", _email("2"), "") is False
+        assert _design(_backup(sw, "2")) == D2
+
+    def test_design_of_a_drifted_profile_is_not_adopted(self, run_env):
+        sw, session_dir = run_env
+        _bootstrap(sw, "2")
+        # An in-session /login re-pointed the profile at another account.
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "someone@else.com", "accountUuid": "z"}
+        }))
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": D3})
+        )
+
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert _design(_backup(sw, "2")) is None
+
+    def test_live_profile_is_not_adopted(self, run_env, monkeypatch):
+        sw, session_dir = run_env
+        _bootstrap(sw, "2")
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": D2})
+        )
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+
+        assert sw._adopt_session_credential("2", _email("2"), "") is None
+        assert _design(_backup(sw, "2")) is None
+
+    def test_reseed_keeps_the_sessions_design(self, run_env):
+        sw, session_dir = run_env
+        _bootstrap(sw, "2")
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": D2})
+        )
+        assert _profile_blob(_bootstrap(sw, "2"))["designOauth"] == D2
+
+    def test_reseed_takes_the_newer_generation(self, run_env):
+        sw, session_dir = run_env
+        newer = {**D2, "accessToken": "fake-d2-newer", "expiresAt": 9000}
+        sw._store._write_account_credentials("2", _email("2"), _login("2", newer))
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(_login("2", D2))
+        assert _profile_blob(_bootstrap(sw, "2"))["designOauth"] == newer
+
+    def test_remove_and_purge_drop_the_session_design_only(
+        self, run_env, temp_home
+    ):
+        sw, session_dir = run_env
+        _bootstrap(sw, "2")
+        blob = _profile_blob(session_dir)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({**blob, "designOauth": D2})
+        )
+        live_before = _live_file(temp_home).read_text()
+
+        with patch("builtins.input", return_value="y"):
+            sw.remove_account("2")
+        assert not session_dir.exists()
+        assert _live_file(temp_home).read_text() == live_before
+
+        with patch("builtins.input", return_value="y"):
+            sw.purge()
+        assert _live_file(temp_home).read_text() == live_before
+
+
 class TestSwitchMatrixWindows(TestSwitchMatrix):
     @pytest.fixture
     def linux(self, temp_home, monkeypatch):  # the Windows file backend
