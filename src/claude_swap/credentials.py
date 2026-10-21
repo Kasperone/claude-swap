@@ -1134,6 +1134,29 @@ class CredentialStore:
             return None
         return shared_credential_fields(text) if is_login_less(text) else None
 
+    def live_design_oauth(self) -> tuple[dict | None, bool]:
+        """The active store's ``designOauth`` and whether the store was readable.
+
+        Raw, login or not: the active profile's Keychain item when the Keychain
+        is in use and holds one, else the plaintext file — Claude Code's own
+        read order. ``(None, True)`` when there is none; ``(None, False)``
+        when the Keychain read failed or the file could not be read.
+        """
+        if self._use_keychain():
+            value, failed = self._read_active_oauth_keychain()
+            if failed:
+                return None, False
+            if value:
+                return design_oauth_of(value), True
+        cred_file = get_credentials_path()
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, True
+        except (OSError, ValueError):
+            return None, False
+        return design_oauth_of(text), True
+
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 

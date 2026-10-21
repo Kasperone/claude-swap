@@ -318,6 +318,65 @@ def _profile_design_oauth(session_dir: Path) -> dict | None:
     return design_oauth_of(text)
 
 
+def strip_profile_design_oauth(session_dir: Path) -> bool:
+    """Remove ``designOauth`` from a quiescent profile, keeping its login.
+
+    For the per-account migration: a profile seeded with another account's
+    Design login. The profile's current blob (its first hashed item, else its
+    file, as :func:`_profile_design_oauth` reads it) is written back without
+    ``designOauth`` as the plaintext file, and every hashed item still holding
+    one is deleted — the same delete-then-seed shape as a bootstrap, with the
+    profile's own login generation instead of the backup's, so cswap still
+    never writes a hashed item. Caller holds cswap's lock and checked
+    quiescence. Returns whether the profile now holds no ``designOauth``
+    (``False`` when its store could not be read or written).
+    """
+    blob: str | None = None
+    holding: list[str] = []
+    if Platform.detect() == Platform.MACOS:
+        for service in _keychain_services(str(session_dir)):
+            try:
+                value = _keychain_entry(service, strict=False)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return False
+            if value is None:
+                continue
+            if blob is None:
+                blob = value
+            if design_oauth_of(value) is not None:
+                holding.append(service)
+    creds_path = session_dir / ".credentials.json"
+    if blob is None:
+        try:
+            blob = creds_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError):
+            return False
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    data.pop("designOauth", None)
+    try:
+        file_design = design_oauth_of(creds_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        file_design = None
+    if holding or file_design is not None:
+        try:
+            atomic_write_json(creds_path, data)
+        except OSError:
+            return False
+    for service in holding:
+        try:
+            macos_keychain.delete_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return False
+    return True
+
+
 def read_session_credentials(session_dir: Path) -> str | None:
     """Best-effort read of a session profile's *current* credential JSON.
 

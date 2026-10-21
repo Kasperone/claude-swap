@@ -295,7 +295,7 @@ class TestFailures:
         # Source entry preserved, migration not recorded → retried next run.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.store
         assert fake.deleted == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
         # The bad/partial file must not shadow the intact keyring entry.
         assert not (
             switcher.credentials_dir / ".creds-1-a@example.com.enc"
@@ -324,7 +324,7 @@ class TestFailures:
         # The healthy account migrated; the failed one is untouched + unmarked.
         assert switcher._read_account_credentials("1", "ok@example.com") == "good"
         assert (KEYRING_SERVICE, "account-2-bad@example.com") in fake.store
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
 
     def test_partial_failure_raises_from_migration_fn(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -345,7 +345,7 @@ class TestFailures:
         # Runner swallows it and leaves it unmarked.
         with patch.dict(sys.modules, {"keyring": None}):
             run_migrations(switcher)
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert "windows_keyring_to_files" not in migrations._load_applied(switcher)
 
 
 # ---------------------------------------------------------------------------

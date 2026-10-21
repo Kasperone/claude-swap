@@ -493,10 +493,199 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+_DESIGN_TAG = "design_oauth_per_account"
+# Short: this runs at switcher construction, and a busy lock only defers it.
+_DESIGN_LOCK_TIMEOUT = 2.0
+
+
+def _assign_design_oauth(
+    switcher: "ClaudeAccountSwitcher", data: dict
+) -> tuple[int, int, int]:
+    """One pass of :func:`migrate_design_oauth_per_account`, under cswap's lock.
+
+    Returns ``(changed, deferred, unreadable)`` counts.
+    """
+    from claude_swap.credentials import (
+        design_fingerprint,
+        design_oauth_of,
+        with_design_oauth,
+    )
+    from claude_swap.session import (
+        _profile_design_oauth,
+        profile_is_quiescent,
+        strip_profile_design_oauth,
+    )
+
+    accounts = data.get("accounts", {})
+    log = switcher._logger
+    tag = _DESIGN_TAG
+    live, readable = switcher._store.live_design_oauth()
+    if not readable:
+        raise MigrationIncomplete(f"{tag}: the live credential store is unreadable")
+    live_fp = design_fingerprint(live)
+    owner = None
+    identity = switcher._get_current_account()
+    if live is not None and identity is not None:
+        slot = switcher._find_account_slot(data, *identity)
+        if slot is not None and switcher._account_kind(slot) != "api_key":
+            owner = slot
+
+    backups: dict[str, str] = {}
+    profiles: dict[str, tuple[Path, dict]] = {}
+    families: dict[str, set[str]] = {}
+    unreadable = 0
+    for num, info in accounts.items():
+        email = info.get("email", "")
+        creds, failed = switcher._read_account_credentials_ex(num, email)
+        if failed:
+            unreadable += 1
+            continue
+        backups[num] = creds or ""
+        fp = design_fingerprint(design_oauth_of(creds))
+        if fp:
+            families.setdefault(fp, set()).add(num)
+        session_dir = switcher._session_dir(num, email)
+        if session_dir.is_dir():
+            design = _profile_design_oauth(session_dir)
+            if design is not None:
+                profiles[num] = (session_dir, design)
+                families.setdefault(design_fingerprint(design), set()).add(num)
+
+    def owner_of(fp: str | None) -> str | None:
+        if fp is None:
+            return None
+        if fp == live_fp:
+            return owner
+        slots = families.get(fp, set())
+        return next(iter(slots)) if len(slots) == 1 else None
+
+    changed = deferred = 0
+    for num, creds in backups.items():
+        email = accounts[num].get("email", "")
+        design = design_oauth_of(creds)
+        fp = design_fingerprint(design)
+        if num == owner:
+            updated = with_design_oauth(creds, live)
+            action = f"set to the live Design login {live_fp}"
+        elif design is not None and owner_of(fp) != num:
+            updated = with_design_oauth(creds, None)
+            action = f"removed Design login {fp} (not this account's)"
+        else:
+            continue
+        if updated == creds:
+            continue
+        switcher._store._write_account_credentials(num, email, updated)
+        if num != owner:
+            # The retained generation still holds the removed copy.
+            switcher._store.delete_previous_backup(num, email)
+        backups[num] = updated
+        changed += 1
+        log.info(f"{tag}: Account-{num} backup: {action}")
+
+    for num, (session_dir, design) in profiles.items():
+        email = accounts[num].get("email", "")
+        fp = design_fingerprint(design)
+        if owner_of(fp) == num:
+            backup = backups.get(num, "")
+            if backup and design_oauth_of(backup) is None:
+                updated = with_design_oauth(backup, design)
+                if updated != backup:
+                    switcher._store._write_account_credentials(num, email, updated)
+                    changed += 1
+                    log.info(
+                        f"{tag}: Account-{num} backup: adopted the session "
+                        f"profile's own Design login {fp}"
+                    )
+            continue
+        if not profile_is_quiescent(session_dir):
+            deferred += 1
+            log.info(
+                f"{tag}: Account-{num} session profile holds Design login "
+                f"{fp} (not this account's); deferred, a claude is running in it"
+            )
+            continue
+        if not strip_profile_design_oauth(session_dir):
+            deferred += 1
+            log.warning(
+                f"{tag}: Account-{num} session profile: could not remove "
+                f"Design login {fp}; will retry"
+            )
+            continue
+        changed += 1
+        log.info(
+            f"{tag}: Account-{num} session profile: removed Design login "
+            f"{fp} (not this account's)"
+        )
+    return changed, deferred, unreadable
+
+
+def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
+    """Make every slot and session profile hold only its own ``designOauth``.
+
+    Earlier versions of this fork treated ``designOauth`` (Claude Design's
+    ``/design-login``) as machine-shared: the live copy won every switch, so
+    whatever was live was captured into each slot on add/switch and seeded
+    into new session profiles. It is account-owned now
+    (``ACCOUNT_CREDENTIAL_KEYS``), so those copies are other accounts' logins.
+    Token families are compared by :func:`design_fingerprint` (sha256 of the
+    refresh token, 12 hex digits); only fingerprints are logged.
+
+    1. The live store's Design login L is attributed to the account logged in
+       (the slot its ``oauthAccount`` resolves to) and written into that
+       slot's backup: it is the freshest generation. An API-key or unmanaged
+       live login owns none, and the live store is never written.
+    2. A family is kept only where it is attributable to one slot: L's at its
+       owner, and any other family that occurs in exactly one slot (backup
+       and session profile), e.g. an account's own copy from before the
+       shared era. L's family elsewhere, and families found in several
+       slots, are removed from those backups (with their ``.prev``
+       generation) and from those session profiles.
+    3. A session profile is rewritten only while no claude runs in it
+       (:func:`strip_profile_design_oauth`); a live one defers the migration,
+       which then retries on a later run. A profile's own Design login is
+       adopted into its slot's backup when the backup has none.
+
+    Idempotent: a second run finds nothing to change.
+    """
+    from claude_swap.exceptions import LockError
+    from claude_swap.locking import FileLock
+
+    if not switcher.sequence_file.exists():
+        return False
+    data = switcher._get_sequence_data()
+    if data is None:
+        return False
+    accounts = data.get("accounts", {})
+    if not accounts:
+        return True
+
+    tag = _DESIGN_TAG
+    try:
+        with FileLock(switcher.lock_file, timeout=_DESIGN_LOCK_TIMEOUT):
+            changed, deferred, unreadable = _assign_design_oauth(switcher, data)
+    except LockError as e:
+        raise MigrationIncomplete(f"{tag}: cswap is busy ({e})") from e
+
+    if changed:
+        print(
+            "claude-swap: Claude Design logins are now kept per account; "
+            f"updated {changed} stored cop{'y' if changed == 1 else 'ies'} "
+            "(fingerprints in the log)",
+            file=sys.stderr,
+        )
+    if unreadable or deferred:
+        raise MigrationIncomplete(
+            f"{tag}: {unreadable} unreadable backup(s), {deferred} session "
+            "profile(s) deferred; will retry on next run"
+        )
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
+    ("design_oauth_per_account", migrate_design_oauth_per_account),
 ]
 
 
