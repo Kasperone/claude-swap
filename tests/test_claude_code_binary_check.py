@@ -49,5 +49,32 @@ def test_unrelated_binary_fails_every_check(tmp_path):
     assert len(module.check_binary("x", str(binary))) == len(module.CHECKS)
 
 
+WINDOWS = GOOD + b"""
+function Vn(){if(Q)return Q;if(JQn())return B(F,D);return D}
+if(process.env.CLAUDE_CODE_FORCE_WINDOWS_CREDMAN==="1")return!0;
+JSON.parse(n).cachedGrowthBookFeatures?.tengu_windows_credman===!0
+var F={name:"windows-credman",osGuarded:!0,read(){}}
+return{service:hre(m2e),name:v1()}
+let i=await e.readAsync(),c=await e.update(a);if(c.success){if(i===null)await r.delete(o)
+"""
+
+
+def test_windows_binary_runs_the_windows_checks(tmp_path):
+    module = _load()
+    exe = tmp_path / "claude.exe"
+    exe.write_bytes(WINDOWS)
+    assert module.check_binary("w", str(exe)) == []
+
+    # credman by default: the opt-in gate is gone
+    exe.write_bytes(WINDOWS.replace(b"if(JQn())return B(F,D);return D", b"return B(F,D)"))
+    failures = module.check_binary("w2", str(exe))
+    assert len(failures) == 1 and "credman only when opted in" in failures[0]
+
+    # POSIX binaries are not held to the Windows expectations
+    posix = tmp_path / "claude"
+    posix.write_bytes(GOOD)
+    assert module.check_binary("p", str(posix)) == []
+
+
 def test_cswap_side_assertions_hold():
     _load().check_cswap()

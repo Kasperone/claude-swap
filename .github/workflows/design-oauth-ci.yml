@@ -1,4 +1,5 @@
-# Branch-only CI for fix/preserve-design-oauth: full suite on Linux and macOS,
+# Branch-only CI for fix/preserve-design-oauth: full suite on Linux, macOS and
+# Windows,
 # plus the designOauth tests against a REAL macOS Keychain (throwaway keychain,
 # password generated per run, fake credentials only).
 name: designOauth CI
@@ -16,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
@@ -60,28 +61,38 @@ jobs:
           tests/test_design_oauth_macos_real.py
 
       - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
+        shell: bash
         env:
           CC_PINNED_VERSION: 2.1.306
         run: |
           # Read-only: `npm pack` only downloads tarballs (no install scripts,
           # no execution, no login); binaries are inspected as bytes. Runs
           # against the pinned version AND the latest published one, for this
-          # runner's OS (darwin Keychain + plaintext, linux plaintext only), so
-          # a Claude Code release that changes the credential storage turns
-          # this red with the broken expectation named.
-          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-          ARCH="$(uname -m | sed -e 's/x86_64/x64/' -e 's/aarch64/arm64/')"
+          # runner's OS (darwin Keychain + plaintext, linux plaintext only,
+          # win32 plaintext unless Credential Manager is opted into), so a
+          # Claude Code release that changes the credential storage turns this
+          # red with the broken expectation named.
+          case "$RUNNER_OS" in
+            Linux) OS=linux; BIN=claude ;;
+            macOS) OS=darwin; BIN=claude ;;
+            Windows) OS=win32; BIN=claude.exe ;;
+          esac
+          ARCH="$(echo "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
           PKG="@anthropic-ai/claude-code-$OS-$ARCH"
           LATEST="$(npm view "$PKG" version)"
           echo "package=$PKG pinned=$CC_PINNED_VERSION latest=$LATEST"
+          # Windows: a drive-letter path with forward slashes works for both
+          # Git Bash and the Windows Python reading the binary.
+          TMPROOT="$RUNNER_TEMP"
+          command -v cygpath >/dev/null && TMPROOT="$(cygpath -m "$RUNNER_TEMP")"
           ARGS=()
           for VERSION in "$CC_PINNED_VERSION" "$LATEST"; do
-            DIR="$RUNNER_TEMP/cc-$VERSION"
+            DIR="$TMPROOT/cc-$VERSION"
             [ -d "$DIR" ] && continue
             mkdir -p "$DIR/extract"
             (cd "$DIR" && npm pack "$PKG@$VERSION" --silent >/dev/null \
               && tar -xzf ./*.tgz -C extract)
-            ARGS+=("$VERSION=$DIR/extract/package/claude")
+            ARGS+=("$VERSION=$DIR/extract/package/$BIN")
           done
           uv run python .github/scripts/check_claude_code_keychain.py "${ARGS[@]}"
 

@@ -12,6 +12,8 @@ asserts the credential-storage logic cswap mirrors is still there:
 * the plaintext file lives in the secure-storage dir (CLAUDE_SECURESTORAGE_CONFIG_DIR
   when defined, empty = ~/.claude), and the only storage kinds are keychain,
   plaintext and windows-credman — Linux has no secret-store backend
+* Windows (``*.exe``): Credential Manager is opt-in only; otherwise the
+  plaintext file is the store (WINDOWS_CHECKS)
 
 Patterns avoid minified identifiers (they change every release) and anchor on
 string literals and property names instead.
@@ -46,12 +48,31 @@ CHECKS = {
     "designOauth write (blob spread)": rb"\.\.\.\w+,designOauth:\w+",
 }
 
+# win32 builds only (``claude.exe``): the plaintext file stays the store unless
+# Credential Manager is opted into, which cswap does not support. If the opt-in
+# gate disappears (credman by default), cswap's file writes stop reaching
+# Claude Code on Windows.
+WINDOWS_CHECKS = {
+    "store selector: credman only when opted in, else plaintext":
+        rb"function \w+\(\)\{if\(\w+\)return \w+;if\(\w+\(\)\)return \w+\(\w+,\w+\);return \w+\}",
+    "credman opt-in env var": rb'process\.env\.CLAUDE_CODE_FORCE_WINDOWS_CREDMAN==="1"\)return!0',
+    "credman opt-in feature flag": rb"cachedGrowthBookFeatures\?\.tengu_windows_credman===!0",
+    "credman backend via Bun.secrets": rb'name:"windows-credman",osGuarded:!0',
+    "credman entry = Keychain service + account": rb"\{service:\w+\(\w+\),name:\w+\(\)\}",
+    "first credman write deletes the plaintext file":
+        rb"let \w+=await \w+\.readAsync\(\),\w+=await \w+\.update\(\w+\);"
+        rb"if\(\w+\.success\)\{if\(\w+===null\)await \w+\.delete\(\w+\)",
+}
+
 
 def check_binary(label: str, path: str) -> list[str]:
     """Return a failure message per broken expectation (empty when all hold)."""
     data = Path(path).read_bytes()
+    checks = dict(CHECKS)
+    if path.lower().endswith(".exe"):
+        checks.update(WINDOWS_CHECKS)
     failures = []
-    for name, pattern in CHECKS.items():
+    for name, pattern in checks.items():
         match = re.search(pattern, data)
         print(f"{'ok  ' if match else 'FAIL'} [{label}] {name}: "
               f"{match.group(0).decode(errors='replace') if match else 'not found'}")
