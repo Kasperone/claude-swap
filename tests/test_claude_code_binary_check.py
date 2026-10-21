@@ -14,6 +14,9 @@ CLAUDE_SECURESTORAGE_CONFIG_DIR
 ["find-generic-password","-a",yP(),"-w","-s",RB()]
 /^[a-zA-Z0-9._-]+$/ claude-code-user .credentials.json
 (await Vn().readAsync(r))?.designOauth ({...e,designOauth:r})
+{storageDir:e,storagePath:Q(e,".credentials.json")}
+let e=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;if(e!==void 0)return(e||u(o(),".claude"))
+new Set(["keychain","plaintext","windows-credman"])
 """
 
 

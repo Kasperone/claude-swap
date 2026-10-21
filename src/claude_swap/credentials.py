@@ -821,9 +821,9 @@ class CredentialStore:
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
-        cred_dir = get_claude_config_home()
+        cred_file = get_credentials_path()
+        cred_dir = cred_file.parent
         cred_dir.mkdir(parents=True, exist_ok=True)
-        cred_file = cred_dir / ".credentials.json"
         import tempfile
         fd, tmp_path = tempfile.mkstemp(dir=str(cred_dir), suffix=".tmp")
         try:

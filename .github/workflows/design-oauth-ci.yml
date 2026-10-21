@@ -59,20 +59,21 @@ jobs:
           uv run pytest -o faulthandler_timeout=300 -v -n 0
           tests/test_design_oauth_macos_real.py
 
-      - name: Check cswap's Keychain naming against Claude Code (pinned + latest, macOS)
-        if: runner.os == 'macOS'
+      - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
         env:
           CC_PINNED_VERSION: 2.1.306
         run: |
           # Read-only: `npm pack` only downloads tarballs (no install scripts,
           # no execution, no login); binaries are inspected as bytes. Runs
-          # against the pinned version AND the latest published one, so a
-          # Claude Code release that changes the credential storage turns this
-          # red with the broken expectation named.
-          ARCH="$(uname -m | sed 's/x86_64/x64/')"
-          PKG="@anthropic-ai/claude-code-darwin-$ARCH"
+          # against the pinned version AND the latest published one, for this
+          # runner's OS (darwin Keychain + plaintext, linux plaintext only), so
+          # a Claude Code release that changes the credential storage turns
+          # this red with the broken expectation named.
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          ARCH="$(uname -m | sed -e 's/x86_64/x64/' -e 's/aarch64/arm64/')"
+          PKG="@anthropic-ai/claude-code-$OS-$ARCH"
           LATEST="$(npm view "$PKG" version)"
-          echo "pinned=$CC_PINNED_VERSION latest=$LATEST"
+          echo "package=$PKG pinned=$CC_PINNED_VERSION latest=$LATEST"
           ARGS=()
           for VERSION in "$CC_PINNED_VERSION" "$LATEST"; do
             DIR="$RUNNER_TEMP/cc-$VERSION"

@@ -9,6 +9,9 @@ asserts the credential-storage logic cswap mirrors is still there:
 * account  = $USER, or "claude-code-user" for a name outside [a-zA-Z0-9._-]
 * designOauth is read from / spread into the same credential blob
   (plaintext fallback: .credentials.json)
+* the plaintext file lives in the secure-storage dir (CLAUDE_SECURESTORAGE_CONFIG_DIR
+  when defined, empty = ~/.claude), and the only storage kinds are keychain,
+  plaintext and windows-credman — Linux has no secret-store backend
 
 Patterns avoid minified identifiers (they change every release) and anchor on
 string literals and property names instead.
@@ -36,6 +39,9 @@ CHECKS = {
     "account name rule": rb"\^\[a-zA-Z0-9\._-\]\+\$",
     "account fallback": rb"claude-code-user",
     "plaintext fallback file": rb"\.credentials\.json",
+    "plaintext file in the secure-storage dir": rb'storagePath:\w+\(\w+,"\.credentials\.json"\)',
+    "secure-storage dir rule": rb"process\.env\.CLAUDE_SECURESTORAGE_CONFIG_DIR;if\(\w+!==void 0\)return\(\w+\|\|",
+    "storage kinds (no Linux secret store)": rb'"keychain","plaintext","windows-credman"',
     "designOauth read": rb"\?\.designOauth",
     "designOauth write (blob spread)": rb"\.\.\.\w+,designOauth:\w+",
 }
@@ -66,7 +72,17 @@ def check_cswap() -> None:
     )
     from claude_swap.session import keychain_service_name
 
+    from claude_swap.paths import get_credentials_path
+
     assert CLAUDE_CODE_KEYCHAIN_SERVICE == "Claude Code-credentials"
+    with mock.patch.dict(os.environ):
+        os.environ["CLAUDE_CONFIG_DIR"] = "/cfg"
+        os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "/secure"
+        assert get_credentials_path() == Path("/secure/.credentials.json")
+        os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+        assert get_credentials_path() == Path.home() / ".claude" / ".credentials.json"
+        del os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+        assert get_credentials_path() == Path("/cfg/.credentials.json")
     assert re.fullmatch(
         r"Claude Code-credentials-[0-9a-f]{8}", keychain_service_name("/some/dir")
     )
