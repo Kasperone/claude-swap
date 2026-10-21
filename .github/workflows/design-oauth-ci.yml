@@ -1,4 +1,4 @@
-# Branch-only CI for fix/preserve-design-oauth: full suite on Linux, macOS and
+# Branch-only CI for the designOauth branches: full suite on Linux, macOS and
 # Windows,
 # plus the designOauth tests against a REAL macOS Keychain (throwaway keychain,
 # password generated per run, fake credentials only).
@@ -6,7 +6,10 @@ name: designOauth CI
 
 on:
   push:
-    branches: [fix/preserve-design-oauth, fix/preserve-design-oauth-latest]
+    branches:
+      - fix/preserve-design-oauth
+      - fix/preserve-design-oauth-latest
+      - feat/per-account-design-oauth
   workflow_dispatch:
 
 permissions:
@@ -71,6 +74,7 @@ jobs:
         run: >
           uv run pytest -o faulthandler_timeout=300 -v -rs -n 0
           tests/test_design_oauth_windows.py tests/test_windows_credman.py
+          tests/test_design_oauth_per_account.py
 
       - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
         shell: bash

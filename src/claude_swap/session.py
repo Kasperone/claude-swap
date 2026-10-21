@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.credentials import is_login_less, with_design_oauth
+from claude_swap.credentials import design_oauth_of, is_login_less, with_design_oauth
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -270,16 +270,6 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         pass  # best-effort; absent entry is already success (rc 44)
 
 
-def _design_oauth_of(credentials: str | None) -> dict | None:
-    """The ``designOauth`` object of a credential JSON blob, else ``None``."""
-    try:
-        data = json.loads(credentials) if credentials else None
-    except (json.JSONDecodeError, TypeError):
-        return None
-    design = data.get("designOauth") if isinstance(data, dict) else None
-    return design if isinstance(design, dict) else None
-
-
 def _profile_design_oauth(session_dir: Path) -> dict | None:
     """The profile's own ``designOauth``, from its hashed item(s) then its file.
 
@@ -296,12 +286,12 @@ def _profile_design_oauth(session_dir: Path) -> dict | None:
             except macos_keychain.KEYCHAIN_ERRORS:
                 return None
             if value is not None:
-                return _design_oauth_of(value)
+                return design_oauth_of(value)
     try:
         text = (session_dir / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):
         return None
-    return _design_oauth_of(text)
+    return design_oauth_of(text)
 
 
 def read_session_credentials(session_dir: Path) -> str | None:

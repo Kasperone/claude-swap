@@ -768,11 +768,16 @@ class ClaudeAccountSwitcher:
         account-bound state such as ``trustedDeviceToken`` — and any field
         cswap does not recognize — must not leak across an account switch.
 
+        Account-owned siblings (``ACCOUNT_CREDENTIAL_KEYS``: ``designOauth``,
+        ``cloudSessionsOauth``) are the target slot's own: activated as stored,
+        or absent when the slot has none. There is no fallback to the live or
+        any other account's copy, which would hand one account's login to
+        another.
+
         When there is no live JSON credential object (fresh machine, or a
-        managed API key is active), the shared fields come from the login-less
-        residue an API-key activation leaves in the active store (it keeps
-        ``designOauth``); with no residue the stored blob activates unchanged,
-        exactly as before.
+        managed API key is active), the shared fields come from a login-less
+        blob Claude Code wrote into the active store while the key was active;
+        with none the stored blob activates unchanged, exactly as before.
         """
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:

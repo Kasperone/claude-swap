@@ -26,6 +26,7 @@ pytestmark = [
 
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
 DESIGN = {"accessToken": "fake-design-at", "refreshToken": "fake-design-rt"}
+OTHER = {"accessToken": "fake-other-at", "refreshToken": "fake-other-rt"}
 ACCOUNT = "fakeuser"
 
 FAKE_SECURITY = Path(__file__).parent / "fixtures" / "fake_security"
@@ -85,26 +86,31 @@ def test_fake_security_roundtrip(keychain):
 
 
 class TestSwapOnKeychain:
-    def test_oauth_to_oauth_live_design_oauth_wins(self, switcher, keychain):
+    def test_oauth_to_oauth_activates_the_targets_own_design(self, switcher, keychain):
         keychain.put(
             CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
         )
-        _swap(switcher, _login("fake-target", designOauth={"accessToken": "stale"}))
+        _swap(switcher, _login("fake-target", designOauth=OTHER))
 
         item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
-        assert item["designOauth"] == DESIGN
+        assert item["designOauth"] == OTHER
         assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
 
-    def test_oauth_to_api_key_keeps_only_design_oauth(self, switcher, keychain):
+    def test_oauth_to_oauth_without_target_design_has_none(self, switcher, keychain):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        _swap(switcher, _login("fake-target"))
+
+        assert "designOauth" not in keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+
+    def test_oauth_to_api_key_removes_login_and_design(self, switcher, keychain):
         keychain.put(
             CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
         )
         _swap(switcher, API_KEY)
 
-        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
-            "designOauth": DESIGN
-        }
-        # The design-only residue must not mask the activated key.
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
         assert switcher._read_credentials() == API_KEY
 
     def test_oauth_to_api_key_without_design_oauth_removes_item(
@@ -115,16 +121,18 @@ class TestSwapOnKeychain:
 
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
-    def test_api_key_to_oauth_restores_design_oauth(self, switcher, keychain):
-        keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
-        )
+    def test_design_login_while_key_active_does_not_mask_or_cross(
+        self, switcher, keychain
+    ):
         _swap(switcher, API_KEY)
-        _swap(switcher, _login("fake-target"))
+        # /design-login while the key is active.
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, json.dumps({"designOauth": DESIGN}))
+        assert switcher._read_credentials() == API_KEY
 
-        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
-        assert item["designOauth"] == DESIGN
-        assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
+        target = _login("fake-target")
+        _swap(switcher, target)
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == target
 
     def test_api_key_to_oauth_without_residue_is_verbatim(self, switcher, keychain):
         _swap(switcher, API_KEY)
@@ -133,17 +141,17 @@ class TestSwapOnKeychain:
 
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == target
 
-    def test_stale_credentials_file_is_refreshed_with_design_oauth(
+    def test_stale_credentials_file_is_refreshed_with_the_targets_design(
         self, switcher, keychain, temp_home
     ):
         cred_file = temp_home / ".claude" / ".credentials.json"
-        cred_file.write_text(_login("fake-old"))
+        cred_file.write_text(_login("fake-old", designOauth=DESIGN))
         keychain.put(
             CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
         )
-        _swap(switcher, _login("fake-target"))
+        _swap(switcher, _login("fake-target", designOauth=OTHER))
 
-        assert json.loads(cred_file.read_text())["designOauth"] == DESIGN
+        assert json.loads(cred_file.read_text())["designOauth"] == OTHER
 
 
 class TestAddRemovePurgeOnKeychain:
@@ -198,15 +206,18 @@ class TestAddRemovePurgeOnKeychain:
 
 class TestKeychainWriteFailure:
     """The Keychain write fails, so cswap falls back to the file and deletes
-    the Keychain item (it would shadow the file). designOauth and the other
-    shared fields the item holds must travel into the file first."""
+    the Keychain item (it would shadow the file). The machine-shared fields
+    the item holds travel into the file first; its designOauth does not — it
+    belongs to the outgoing account."""
 
     @pytest.fixture
     def failing(self, switcher, keychain, monkeypatch):
         monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
         return switcher
 
-    def test_design_oauth_moves_into_file(self, failing, keychain, temp_home):
+    def test_shared_fields_move_into_file_design_does_not(
+        self, failing, keychain, temp_home
+    ):
         item = _login(
             "fake-live",
             designOauth=DESIGN,
@@ -218,46 +229,29 @@ class TestKeychainWriteFailure:
 
         written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
-        assert written["designOauth"] == DESIGN
+        assert "designOauth" not in written
         assert written["mcpOAuth"] == {"server": {"refreshToken": "fake-mcp"}}
         # The stale item is gone so it cannot shadow the file.
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
-    def test_credentials_own_fields_win_over_the_item(
-        self, failing, keychain, temp_home
-    ):
+    def test_credentials_own_design_is_written(self, failing, keychain, temp_home):
         keychain.put(
             CLAUDE_CODE_KEYCHAIN_SERVICE,
             _login("fake-live", designOauth={"accessToken": "older"}),
         )
-        incoming = _login("fake-target", designOauth=DESIGN)
+        incoming = _login("fake-target", designOauth=OTHER)
 
         failing._write_credentials(incoming)
 
         written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
-        assert written["designOauth"] == DESIGN
-
-    def test_full_swap_keeps_design_oauth_when_live_was_unreadable(
-        self, failing, keychain, temp_home
-    ):
-        # No live read reached _prepare (nothing composed in): the item alone
-        # carries designOauth.
-        keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
-        )
-
-        failing._write_credentials(
-            failing._prepare_credentials_for_activation(_login("fake-target"), None)
-        )
-
-        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
-        assert written["designOauth"] == DESIGN
-        assert failing._read_credentials() == json.dumps(written)
+        assert written["designOauth"] == OTHER
 
     def test_item_without_shared_fields_leaves_credentials_verbatim(
         self, failing, keychain, temp_home
     ):
-        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live"))
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
         target = _login("fake-target")
 
         failing._write_credentials(target)
@@ -293,42 +287,15 @@ def test_account_name_falls_back_like_claude_code(monkeypatch):
 
 
 class TestReviewFindingsKeychain:
-    """Review findings R1 and R2 on the fake-security Keychain."""
-
-    def test_r1_design_kept_by_in_place_update(self, switcher, keychain, monkeypatch):
-        keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
-        )
-        deleted = []
-        real_delete = macos_keychain.delete_password
-        monkeypatch.setattr(
-            macos_keychain,
-            "delete_password",
-            lambda svc, acct: (deleted.append(svc), real_delete(svc, acct))[1],
-        )
-
-        switcher._store._clear_oauth_credential()
-
-        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {"designOauth": DESIGN}
-        assert CLAUDE_CODE_KEYCHAIN_SERVICE not in deleted  # never a both-gone window
-
-    def test_r1_refused_design_update_still_removes_the_login(
-        self, switcher, keychain, monkeypatch
-    ):
-        keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
-        )
-        monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
-
-        switcher._store._clear_oauth_credential()
-
-        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+    """Review finding R2 on the fake-security Keychain."""
 
     def test_r2_graft_reads_once_and_only_after_a_failed_write(
         self, switcher, keychain, monkeypatch, temp_home
     ):
+        mcp = {"server": {"refreshToken": "fake-mcp"}}
         keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+            CLAUDE_CODE_KEYCHAIN_SERVICE,
+            _login("fake-live", designOauth=DESIGN, mcpOAuth=mcp),
         )
         monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
         reads = []
@@ -343,7 +310,8 @@ class TestReviewFindingsKeychain:
 
         assert reads == [CLAUDE_CODE_KEYCHAIN_SERVICE]
         written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
-        assert written["designOauth"] == DESIGN
+        assert written["mcpOAuth"] == mcp
+        assert "designOauth" not in written
 
     def test_r2_unreadable_item_is_read_once_without_retry(
         self, switcher, keychain, monkeypatch, temp_home

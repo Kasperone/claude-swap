@@ -27,6 +27,7 @@ from tests.test_design_oauth_profiles import _seed_slot
 
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
 DESIGN = {"accessToken": "fake-design-at", "refreshToken": "fake-design-rt"}
+OTHER = {"accessToken": "fake-other-at", "refreshToken": "fake-other-rt"}
 
 posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX file modes"
@@ -71,20 +72,22 @@ def _swap(sw: ClaudeAccountSwitcher, target: str) -> None:
 
 
 def _trio(sw: ClaudeAccountSwitcher, cred: Path) -> None:
-    """OAuth -> OAuth -> API key -> OAuth, asserting designOauth throughout."""
-    _swap(sw, _login("fake-target", designOauth={"accessToken": "stale"}))
-    assert json.loads(cred.read_text())["designOauth"] == DESIGN
+    """OAuth -> OAuth -> API key -> OAuth -> OAuth: each activation carries the
+    target's own designOauth, or none, and never the outgoing account's."""
+    _swap(sw, _login("fake-target", designOauth=OTHER))
+    assert json.loads(cred.read_text())["designOauth"] == OTHER
 
     _swap(sw, API_KEY)
-    assert json.loads(cred.read_text()) == {"designOauth": DESIGN}
+    assert not cred.exists()
     assert sw._read_credentials() == API_KEY
 
     _swap(sw, _login("fake-target2"))
-    written = json.loads(cred.read_text())
-    assert written == {
-        "claudeAiOauth": {"accessToken": "fake-target2"},
-        "designOauth": DESIGN,
+    assert json.loads(cred.read_text()) == {
+        "claudeAiOauth": {"accessToken": "fake-target2"}
     }
+
+    _swap(sw, _login("fake-target3", designOauth=DESIGN))
+    assert json.loads(cred.read_text())["designOauth"] == DESIGN
 
 
 def _identity(config_home: Path, global_config: Path) -> None:
@@ -118,7 +121,7 @@ class TestDefaultProfile:
         assert _mode(cred) == 0o600
         after_oauth = cred.stat().st_ino
 
-        _swap(sw, API_KEY)  # designOauth-only residue
+        _swap(sw, _login("fake-target2", designOauth=OTHER))
         assert _mode(cred) == 0o600
 
         # A rename publishes each write (new inode), never a truncate-in-place,

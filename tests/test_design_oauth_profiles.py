@@ -23,6 +23,7 @@ from tests.test_design_oauth_macos import ACCOUNT, keychain  # noqa: F401
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
 DESIGN = {"accessToken": "fake-design-at", "refreshToken": "fake-design-rt"}
 SESSION_DESIGN = {"accessToken": "fake-session-design-at"}
+OTHER = {"accessToken": "fake-other-at", "refreshToken": "fake-other-rt"}
 
 posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="fake security is a POSIX script"
@@ -59,22 +60,22 @@ def _write_identity(profile: Path) -> None:
 
 
 class TestEnvVarProfileFile:
-    def test_swap_trio_keeps_design_oauth(self, profile):
+    def test_swap_trio_activates_each_targets_own_design_oauth(self, profile):
         sw = ClaudeAccountSwitcher()
         sw.platform = Platform.LINUX  # file backend, whatever the host
         cred = profile / ".credentials.json"
         cred.write_text(_login("fake-live", designOauth=DESIGN))
 
-        _swap(sw, _login("fake-target", designOauth={"accessToken": "stale"}))
-        assert json.loads(cred.read_text())["designOauth"] == DESIGN
+        _swap(sw, _login("fake-target", designOauth=OTHER))
+        assert json.loads(cred.read_text())["designOauth"] == OTHER
 
         _swap(sw, API_KEY)
-        assert json.loads(cred.read_text()) == {"designOauth": DESIGN}
+        assert not cred.exists()
         assert sw._read_credentials() == API_KEY
 
         _swap(sw, _login("fake-target2"))
         written = json.loads(cred.read_text())
-        assert written["designOauth"] == DESIGN
+        assert "designOauth" not in written
         assert written["claudeAiOauth"] == {"accessToken": "fake-target2"}
 
     def test_default_profile_file_is_not_touched(self, profile, temp_home):
@@ -117,24 +118,24 @@ class TestEnvVarProfileKeychain:
         sw.platform = Platform.MACOS
         return sw
 
-    def test_swap_trio_keeps_design_oauth_in_the_hashed_item(
+    def test_swap_trio_activates_each_targets_own_design_in_the_hashed_item(
         self, sw, profile, keychain  # noqa: F811
     ):
         hashed = keychain_service_name(str(profile))
         keychain.put(hashed, _login("fake-live", designOauth=DESIGN))
 
-        _swap(sw, _login("fake-target", designOauth={"accessToken": "stale"}))
+        _swap(sw, _login("fake-target", designOauth=OTHER))
         item = keychain.get_json(hashed)
-        assert item["designOauth"] == DESIGN
+        assert item["designOauth"] == OTHER
         assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
 
         _swap(sw, API_KEY)
-        assert keychain.get_json(hashed) == {"designOauth": DESIGN}
+        assert keychain.get(hashed) is None
         assert sw._read_credentials() == API_KEY
 
         _swap(sw, _login("fake-target2"))
         item = keychain.get_json(hashed)
-        assert item["designOauth"] == DESIGN
+        assert "designOauth" not in item
         assert item["claudeAiOauth"] == {"accessToken": "fake-target2"}
 
     def test_default_profile_item_is_never_touched(self, sw, profile, keychain):  # noqa: F811
@@ -191,12 +192,12 @@ class TestEnvVarProfileKeychain:
         assert keychain.get("Claude Code") == default_key
         assert sw._read_credentials() == API_KEY
 
-        _swap(sw, _login("fake-target"))
+        _swap(sw, _login("fake-target", designOauth=OTHER))
         assert keychain.get(hashed_managed) is None
         assert keychain.get("Claude Code") == default_key
         assert keychain.get_json(keychain_service_name(str(profile)))[
             "designOauth"
-        ] == DESIGN
+        ] == OTHER
 
     def test_add_account_sees_the_profiles_own_managed_key_only(
         self, sw, profile, keychain  # noqa: F811
@@ -259,24 +260,24 @@ class TestEnvVarNamingTheDefaultProfile:
             CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
         )
 
-        _swap(sw, _login("fake-target"))
+        _swap(sw, _login("fake-target", designOauth=OTHER))
         item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
-        assert item["designOauth"] == DESIGN
+        assert item["designOauth"] == OTHER
         assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
         assert keychain.get(hashed) is None
 
         _swap(sw, API_KEY)
-        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
-            "designOauth": DESIGN
-        }
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
     def test_hashed_item_is_updated_in_place(self, sw, temp_home, keychain):  # noqa: F811
         hashed = keychain_service_name(str(temp_home / ".claude"))
         keychain.put(hashed, _login("fake-live", designOauth=DESIGN))
 
-        _swap(sw, API_KEY)
+        _swap(sw, _login("fake-target"))
+        assert "designOauth" not in keychain.get_json(hashed)
 
-        assert keychain.get_json(hashed) == {"designOauth": DESIGN}
+        _swap(sw, API_KEY)
+        assert keychain.get(hashed) is None
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
 
@@ -300,8 +301,9 @@ def _seed_slot(sw: ClaudeAccountSwitcher, creds: str) -> None:
 
 
 class TestSessionProfileFile:
-    """Re-seeding a session profile from backup must keep the profile's own
-    designOauth: it logged into Claude Design inside that session."""
+    """Re-seeding a session profile from backup keeps the newer of the
+    account's two Design logins (the profile's on a tie): a /design-login
+    inside the session is this account's."""
 
     def test_reseed_keeps_profile_design_oauth(self, temp_home):
         sw = ClaudeAccountSwitcher()

@@ -30,8 +30,9 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 REAL_ENUMERATE = windows_credman._enumerate_targets
 
 DESIGN = {"accessToken": "fake-design-at"}
+DESIGN_2 = {"accessToken": "fake-design-2-at"}
 LIVE = json.dumps({"claudeAiOauth": {"accessToken": "fake-1"}, "designOauth": DESIGN})
-TARGET = json.dumps({"claudeAiOauth": {"accessToken": "fake-2"}})
+TARGET = json.dumps({"claudeAiOauth": {"accessToken": "fake-2"}, "designOauth": DESIGN_2})
 
 real_credman = pytest.mark.skipif(
     not (sys.platform == "win32" and os.environ.get("CSWAP_CI_CREDMAN") == "1"),
@@ -192,9 +193,14 @@ def _enable_flag(home: Path) -> None:
 
 class TestSwitchOnWindows:
     def test_not_detected_switches(self, windows):
-        _switcher(Platform.WINDOWS).switch_to("2", json_output=True)
+        sw = _switcher(Platform.WINDOWS)
+        sw.switch_to("2", json_output=True)
         written = json.loads(windows.read_text())
-        assert written == {"claudeAiOauth": {"accessToken": "fake-2"}, "designOauth": DESIGN}
+        # Each account keeps its own Design login.
+        assert written == {
+            "claudeAiOauth": {"accessToken": "fake-2"}, "designOauth": DESIGN_2}
+        stored = json.loads(sw._read_account_credentials("1", "1@x.com"))
+        assert stored["designOauth"] == DESIGN
 
     def test_detected_refuses_and_changes_nothing(self, windows, temp_home):
         _enable_flag(temp_home)
@@ -235,7 +241,7 @@ class TestSwitchOnWindows:
         _enable_flag(temp_home)
         monkeypatch.setenv("CSWAP_IGNORE_CREDMAN", "1")
         _switcher(Platform.WINDOWS).switch_to("2", json_output=True)
-        assert json.loads(windows.read_text())["designOauth"] == DESIGN
+        assert json.loads(windows.read_text())["designOauth"] == DESIGN_2
 
 
 class TestOtherPlatformsUnaffected:
@@ -261,7 +267,7 @@ class TestOtherPlatformsUnaffected:
         _switcher(Platform.LINUX).switch_to("2", json_output=True)
 
         assert json.loads(cred.read_text()) == {
-            "claudeAiOauth": {"accessToken": "fake-2"}, "designOauth": DESIGN}
+            "claudeAiOauth": {"accessToken": "fake-2"}, "designOauth": DESIGN_2}
 
 
 class TestCli:

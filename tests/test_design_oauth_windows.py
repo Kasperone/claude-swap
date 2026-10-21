@@ -30,6 +30,7 @@ from claude_swap.switcher import KEYRING_SERVICE, ClaudeAccountSwitcher
 from tests.test_design_oauth_linux import (
     API_KEY,
     DESIGN,
+    OTHER,
     _identity,
     _login,
     _swap,
@@ -88,7 +89,7 @@ class TestDefaultProfile:
 
         with patch.object(fsutil.os, "replace", wraps=fsutil.os.replace) as rep:
             _swap(sw, _login("fake-target"))
-            _swap(sw, API_KEY)  # designOauth-only residue
+            _swap(sw, _login("fake-target2", designOauth=OTHER))
 
         targets = [Path(c.args[1]) for c in rep.call_args_list]
         assert targets.count(cred) == 2  # each write a rename, never in place
@@ -102,7 +103,7 @@ class TestDefaultProfile:
 
         cfg = json.loads((temp_home / ".claude.json").read_text())
         assert cfg["primaryApiKey"] == API_KEY
-        assert json.loads(cred.read_text()) == {"designOauth": DESIGN}
+        assert not cred.exists()  # designOauth goes with the outgoing login
 
     def test_add_remove_purge_leave_the_file_and_claude_codes_credman(self, temp_home):
         """Purge sweeps cswap's legacy ``claude-code`` keyring entries on
@@ -142,7 +143,7 @@ class TestTransientSharingViolations:
         monkeypatch.setattr(fsutil.time, "sleep", lambda _s: None)
 
     @pytest.mark.parametrize("winerror", [5, 32, 33])
-    def test_retried_swap_keeps_design_oauth(self, temp_home, monkeypatch, winerror):
+    def test_retried_swap_writes_the_targets_design(self, temp_home, monkeypatch, winerror):
         cred = temp_home / ".claude" / ".credentials.json"
         cred.write_text(_login("fake-live", designOauth=DESIGN))
         real_replace = fsutil.os.replace
@@ -155,12 +156,12 @@ class TestTransientSharingViolations:
             real_replace(src, dst)
 
         monkeypatch.setattr(fsutil.os, "replace", flaky)
-        _swap(_windows(), _login("fake-target"))
+        _swap(_windows(), _login("fake-target", designOauth=OTHER))
 
         assert len(calls) == 3
         assert json.loads(cred.read_text()) == {
             "claudeAiOauth": {"accessToken": "fake-target"},
-            "designOauth": DESIGN,
+            "designOauth": OTHER,
         }
         assert sorted(p.name for p in cred.parent.iterdir()) == [".credentials.json"]
 
@@ -183,11 +184,11 @@ class TestTransientSharingViolations:
         assert sorted(p.name for p in cred.parent.iterdir()) == [".credentials.json"]
 
     def test_api_key_switch_with_only_the_credentials_file_locked(
-        self, temp_home, monkeypatch, caplog
+        self, temp_home, monkeypatch
     ):
-        """The key lands in the config; the designOauth-only rewrite fails, so
-        the file is removed (R1: a login must never shadow the key) and the
-        loss is logged — the one Windows lock case that drops designOauth."""
+        """The key lands in the config and the login file is unlinked (no
+        rename needed): designOauth goes with the outgoing login, as on every
+        API-key switch."""
         cred = temp_home / ".claude" / ".credentials.json"
         cred.write_text(_login("fake-live", designOauth=DESIGN))
         real_replace = fsutil.os.replace
@@ -203,7 +204,6 @@ class TestTransientSharingViolations:
         cfg = json.loads((temp_home / ".claude.json").read_text())
         assert cfg["primaryApiKey"] == API_KEY
         assert not cred.exists()
-        assert "Could not keep designOauth" in caplog.text
         assert sorted(p.name for p in cred.parent.iterdir()) == []
 
 
@@ -238,7 +238,7 @@ class TestEnvVarProfile:
 
 
 class TestSessionProfile:
-    def test_reseed_keeps_profile_design(self, temp_home):
+    def test_reseed_keeps_profile_design(self, temp_home):  # same account's
         sw = _windows()
         _seed_slot(sw, _login("fake-backup", designOauth={"accessToken": "stale"}))
         session_dir = sw.backup_dir / "sessions" / "1-a-x-com"
@@ -273,13 +273,12 @@ class TestRealWindowsFileSharing:
         assert cred.read_text() == live
         assert sorted(p.name for p in cred.parent.iterdir()) == [".credentials.json"]
 
-        _swap(sw, _login("fake-target"))  # handle closed: succeeds
-        assert json.loads(cred.read_text())["designOauth"] == DESIGN
+        _swap(sw, _login("fake-target", designOauth=OTHER))  # handle closed
+        assert json.loads(cred.read_text())["designOauth"] == OTHER
 
     def test_api_key_switch_under_an_open_reader_keeps_the_file(self, temp_home):
-        """The held handle blocks both the designOauth-only rewrite and the
-        unlink, so the file (login and designOauth) survives and the key still
-        lands in the config — upstream's best-effort removal, unchanged."""
+        """The held handle blocks the unlink, so the file survives and the key
+        still lands in the config — upstream's best-effort removal."""
         cred = temp_home / ".claude" / ".credentials.json"
         live = _login("fake-live", designOauth=DESIGN)
         cred.write_text(live)

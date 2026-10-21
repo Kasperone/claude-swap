@@ -1,6 +1,8 @@
-"""``designOauth`` (Claude Design login) survives every cswap credential path.
+"""``designOauth`` (Claude Design login) is account-owned, like the login.
 
-Fake credentials only, all under the ``temp_home`` fixture's tmp_path.
+Each slot carries its own; a switch activates the target slot's copy (or none)
+and never hands the live account's copy to another account. Fake credentials
+only, all under the ``temp_home`` fixture's tmp_path.
 """
 
 from __future__ import annotations
@@ -9,17 +11,21 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from claude_swap.credentials import (
+    ACCOUNT_CREDENTIAL_KEYS,
     SHARED_CREDENTIAL_KEYS,
+    design_fingerprint,
+    is_login_less,
     merge_shared_credential_fields,
+    newer_design_oauth,
     shared_credential_fields,
+    with_design_oauth,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
 DESIGN = {"accessToken": "fake-design-at", "refreshToken": "fake-design-rt"}
+OTHER = {"accessToken": "fake-other-at", "refreshToken": "fake-other-rt"}
 
 
 def _cred_file(home: Path) -> Path:
@@ -47,15 +53,53 @@ def _seed_account(switcher: ClaudeAccountSwitcher, num: str = "1") -> None:
     switcher._write_json(switcher.sequence_file, data)
 
 
-def test_design_oauth_is_machine_shared():
-    assert "designOauth" in SHARED_CREDENTIAL_KEYS
+def test_design_oauth_is_account_owned():
+    assert "designOauth" in ACCOUNT_CREDENTIAL_KEYS
+    assert "cloudSessionsOauth" in ACCOUNT_CREDENTIAL_KEYS
+    assert "designOauth" not in SHARED_CREDENTIAL_KEYS
+    assert "cloudSessionsOauth" not in SHARED_CREDENTIAL_KEYS
+
+
+class TestHelpers:
+    def test_fingerprint_is_short_and_never_the_token(self):
+        fp = design_fingerprint(DESIGN)
+        assert len(fp) == 12
+        assert "fake" not in fp
+        assert fp != design_fingerprint(OTHER)
+        assert design_fingerprint(None) is None
+        # Same refresh token, rotated access token: same family.
+        assert fp == design_fingerprint({**DESIGN, "accessToken": "rotated"})
+
+    def test_newer_design_oauth_orders_by_expiry(self):
+        old = {**DESIGN, "expiresAt": 1}
+        new = {**DESIGN, "expiresAt": 2}
+        assert newer_design_oauth(old, new) is new
+        assert newer_design_oauth(new, old) is new
+        assert newer_design_oauth(DESIGN, OTHER) is DESIGN  # tie: first
+        assert newer_design_oauth(None, OTHER) is OTHER
+        assert newer_design_oauth(DESIGN, None) is DESIGN
+        assert newer_design_oauth({"expiresAt": "x"}, new)["expiresAt"] == "x"
+
+    def test_with_design_oauth_sets_and_removes(self):
+        login = json.dumps({"claudeAiOauth": {"accessToken": "a"}})
+        with_design = with_design_oauth(login, DESIGN)
+        assert json.loads(with_design)["designOauth"] == DESIGN
+        assert "designOauth" not in json.loads(with_design_oauth(with_design, None))
+        assert with_design_oauth(login, None) == login
+        assert with_design_oauth(API_KEY, DESIGN) == API_KEY
+
+    def test_design_only_blob_is_login_less(self):
+        assert is_login_less(json.dumps({"designOauth": DESIGN}))
+        assert is_login_less(json.dumps({"cloudSessionsOauth": {}, "mcpOAuth": {}}))
+        assert not is_login_less(json.dumps({"claudeAiOauth": {}, "designOauth": {}}))
+        assert not is_login_less(json.dumps({"somethingNew": 1}))
 
 
 class TestSwap:
-    def test_live_design_oauth_wins_over_stale_slot_copy(self):
+    def test_target_slot_keeps_its_own_design_oauth(self):
         target = json.dumps({
             "claudeAiOauth": {"accessToken": "fake-target"},
-            "designOauth": {"accessToken": "stale"},
+            "designOauth": OTHER,
         })
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "fake-live"},
@@ -64,21 +108,23 @@ class TestSwap:
         merged = json.loads(
             merge_shared_credential_fields(target, shared_credential_fields(live))
         )
-        assert merged["designOauth"] == DESIGN
+        assert merged["designOauth"] == OTHER
         assert merged["claudeAiOauth"] == {"accessToken": "fake-target"}
 
-    def test_design_oauth_carried_to_slot_that_never_had_it(self):
+    def test_slot_without_design_oauth_gets_no_fallback(self):
         target = json.dumps({"claudeAiOauth": {"accessToken": "fake-target"}})
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "fake-live"},
             "designOauth": DESIGN,
+            "cloudSessionsOauth": {"accessToken": "fake-cloud"},
         })
         merged = json.loads(
             merge_shared_credential_fields(target, shared_credential_fields(live))
         )
-        assert merged["designOauth"] == DESIGN
+        assert "designOauth" not in merged
+        assert "cloudSessionsOauth" not in merged
 
-    def test_oauth_swap_writes_design_oauth_to_credentials_file(self, temp_home):
+    def test_oauth_swap_writes_only_the_targets_design_oauth(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         live = _live(temp_home, designOauth=DESIGN)
         target = json.dumps({"claudeAiOauth": {"accessToken": "fake-target"}})
@@ -88,18 +134,16 @@ class TestSwap:
         )
 
         written = json.loads(_cred_file(temp_home).read_text())
-        assert written["designOauth"] == DESIGN
+        assert "designOauth" not in written
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
 
-    def test_api_key_swap_keeps_design_oauth_and_drops_login(self, temp_home):
+    def test_api_key_swap_drops_login_and_design_oauth(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         _live(temp_home, designOauth=DESIGN)
 
         switcher._write_credentials(API_KEY)
 
-        assert json.loads(_cred_file(temp_home).read_text()) == {
-            "designOauth": DESIGN
-        }
+        assert not _cred_file(temp_home).exists()
 
     def test_api_key_swap_without_design_oauth_still_removes_file(self, temp_home):
         switcher = ClaudeAccountSwitcher()
@@ -119,7 +163,7 @@ class TestSwap:
 
 
 class TestAddRemovePurge:
-    def test_add_account_leaves_live_design_oauth(self, temp_home):
+    def test_add_account_captures_the_live_design_oauth(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         live = _live(temp_home, designOauth=DESIGN)
@@ -135,6 +179,8 @@ class TestAddRemovePurge:
 
         assert "a@x.com" in json.dumps(switcher._get_sequence_data()["accounts"])
         assert _cred_file(temp_home).read_text() == live
+        stored = switcher._read_account_credentials("1", "a@x.com")
+        assert json.loads(stored)["designOauth"] == DESIGN
 
     def test_remove_account_leaves_live_design_oauth(self, temp_home, monkeypatch):
         switcher = ClaudeAccountSwitcher()
@@ -157,23 +203,27 @@ class TestAddRemovePurge:
         assert _cred_file(temp_home).read_text() == live
 
 
-class TestApiKeyResidue:
-    """After an API-key swap the design-only file must not mask the key, and
-    the next OAuth swap must carry designOauth back."""
+class TestLoginLessBlobs:
+    """What Claude Code writes while a managed key is active must not mask the
+    key, and only its shared fields cross to the next OAuth account."""
 
     def test_active_read_sees_through_design_only_file(self, temp_home):
         switcher = ClaudeAccountSwitcher()
-        _live(temp_home, designOauth=DESIGN)
         switcher._write_credentials(API_KEY)
+        # /design-login while the key is active.
+        _cred_file(temp_home).write_text(json.dumps({"designOauth": DESIGN}))
 
         assert switcher._read_credentials() == API_KEY
 
-    def test_api_key_to_oauth_restores_design_oauth(self, temp_home):
+    def test_api_key_to_oauth_does_not_carry_design_oauth(self, temp_home):
         switcher = ClaudeAccountSwitcher()
-        _live(temp_home, designOauth=DESIGN)
         switcher._write_credentials(API_KEY)
+        _cred_file(temp_home).write_text(json.dumps({"designOauth": DESIGN}))
 
-        target = json.dumps({"claudeAiOauth": {"accessToken": "fake-target"}})
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "fake-target"},
+            "designOauth": OTHER,
+        })
         switcher._write_credentials(
             switcher._prepare_credentials_for_activation(
                 target, switcher._read_credentials()
@@ -181,32 +231,11 @@ class TestApiKeyResidue:
         )
 
         written = json.loads(_cred_file(temp_home).read_text())
-        assert written["designOauth"] == DESIGN
+        assert written["designOauth"] == OTHER
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
 
-
-class TestReviewFindingsFile:
-    """Review findings R1, R3 and R4 on the file backend."""
-
-    def test_r1_failed_design_rewrite_still_removes_the_login(
-        self, temp_home, monkeypatch
-    ):
+    def test_login_less_blob_carries_shared_keys_only(self, temp_home):
         switcher = ClaudeAccountSwitcher()
-        _live(temp_home, designOauth=DESIGN)
-
-        def refuse(self, creds):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(
-            type(switcher._store), "_write_active_credentials_file", refuse
-        )
-        switcher._store._clear_oauth_credential()
-
-        assert not _cred_file(temp_home).exists()
-
-    def test_r3_residue_with_added_shared_key_does_not_mask_the_key(self, temp_home):
-        switcher = ClaudeAccountSwitcher()
-        _live(temp_home, designOauth=DESIGN)
         switcher._write_credentials(API_KEY)
         # Claude Code rewrites the whole blob, e.g. after an MCP authorisation.
         mcp = {"server": {"refreshToken": "fake-mcp"}}
@@ -226,11 +255,11 @@ class TestReviewFindingsFile:
             )
         )
         written = json.loads(_cred_file(temp_home).read_text())
-        assert written["designOauth"] == DESIGN
+        assert "designOauth" not in written
         assert written["mcpOAuth"] == mcp
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
 
-    def test_r3_login_less_blob_without_a_key_is_still_live_state(self, temp_home):
+    def test_login_less_blob_without_a_key_is_still_live_state(self, temp_home):
         # Upstream's behaviour: with no managed key, the login-less blob is
         # what the switch composes shared fields from.
         switcher = ClaudeAccountSwitcher()
@@ -239,7 +268,7 @@ class TestReviewFindingsFile:
 
         assert switcher._read_credentials() == blob
 
-    def test_r3_capture_never_takes_a_residue_for_a_login(self, temp_home):
+    def test_capture_never_takes_a_login_less_blob_for_a_login(self, temp_home):
         from claude_swap.session import read_config_dir_credentials
 
         profile = temp_home / "p"
@@ -251,7 +280,7 @@ class TestReviewFindingsFile:
 
         assert read_config_dir_credentials(str(profile)) is None
 
-    def test_r4_stale_login_file_is_not_a_residue_source(self, temp_home):
+    def test_stale_login_file_is_not_a_residue_source(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         _live(temp_home, designOauth={"accessToken": "stale-file-copy"})
         target = json.dumps({

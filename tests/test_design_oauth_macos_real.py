@@ -110,7 +110,7 @@ class TestRealKeychainWriteFailure:
         mcpOAuth={"server": {"refreshToken": "fake-mcp"}},
     )
 
-    def test_refused_write_moves_design_oauth_into_file(
+    def test_refused_write_moves_shared_fields_but_not_design_into_file(
         self, switcher, keychain, temp_home, monkeypatch
     ):
         keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, self.ITEM)
@@ -120,7 +120,7 @@ class TestRealKeychainWriteFailure:
 
         written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
-        assert written["designOauth"] == DESIGN
+        assert "designOauth" not in written  # the outgoing account's
         assert written["mcpOAuth"] == {"server": {"refreshToken": "fake-mcp"}}
         # The stale item was really deleted, so it cannot shadow the file.
         monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
@@ -131,8 +131,8 @@ class TestRealKeychainWriteFailure:
     ):
         # A genuinely locked keychain (a read-only keychain *file* did not block
         # writes on the CI runner, measured). Reads fail too, so the item cannot
-        # be consulted: the composed credential, which already carries
-        # designOauth, must reach the file without raising.
+        # be consulted: the composed credential, which carries the target
+        # account's own designOauth, must reach the file without raising.
         path = os.environ["CSWAP_CI_KEYCHAIN"]
         keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, self.ITEM)
         real = [str(REAL_SECURITY)]
