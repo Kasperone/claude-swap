@@ -126,22 +126,26 @@ class TestRealKeychainWriteFailure:
         monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
-    def test_read_only_keychain_file_keeps_design_oauth(
+    def test_locked_keychain_falls_back_to_file_with_design_oauth(
         self, switcher, keychain, temp_home
     ):
-        path = Path(os.environ["CSWAP_CI_KEYCHAIN"])
+        # A genuinely locked keychain (a read-only keychain *file* did not block
+        # writes on the CI runner, measured). Reads fail too, so the item cannot
+        # be consulted: the composed credential, which already carries
+        # designOauth, must reach the file without raising.
+        path = os.environ["CSWAP_CI_KEYCHAIN"]
         keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, self.ITEM)
-        path.chmod(0o444)
+        real = [str(REAL_SECURITY)]
+        subprocess.run(real + ["lock-keychain", path], check=True)
         try:
             try:
                 macos_keychain.set_password("claude-swap-probe", ACCOUNT, "x")
             except macos_keychain.KEYCHAIN_ERRORS:
                 pass
             else:
-                macos_keychain.delete_password("claude-swap-probe", ACCOUNT)
-                pytest.skip("a read-only keychain file did not block writes here")
+                pytest.skip("the locked keychain still accepted a write here")
 
-            switcher._write_credentials(_login("fake-target"))
+            switcher._write_credentials(_login("fake-target", designOauth=DESIGN))
 
             written = json.loads(
                 (temp_home / ".claude" / ".credentials.json").read_text()
@@ -149,4 +153,7 @@ class TestRealKeychainWriteFailure:
             assert written["designOauth"] == DESIGN
             assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
         finally:
-            path.chmod(0o600)
+            subprocess.run(
+                real + ["unlock-keychain", "-p", os.environ["CSWAP_CI_KEYCHAIN_PW"], path],
+                check=False,
+            )

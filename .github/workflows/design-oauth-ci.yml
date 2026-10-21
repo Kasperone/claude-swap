@@ -48,6 +48,9 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN"
           security default-keychain -s "$KEYCHAIN"
           echo "CSWAP_CI_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          # Generated per run and masked; the tests need it to unlock again
+          # after deliberately locking the keychain.
+          echo "CSWAP_CI_KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
 
       - name: designOauth against the real Keychain (macOS)
         if: runner.os == 'macOS'
