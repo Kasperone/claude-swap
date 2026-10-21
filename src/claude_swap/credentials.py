@@ -244,11 +244,16 @@ SHARED_CREDENTIAL_KEYS = frozenset({
 # and deletes both on a re-login (2.1.306: ``delete e.claudeAiOauth, ...,
 # delete e.designOauth, delete e.cloudSessionsOauth``), so each slot carries
 # its own and a switch never hands one account's copy to another.
+# The rest of what that re-login prunes is account-bound too, so it is named
+# here as well (it already stayed slot-owned as "unrecognized").
 ACCOUNT_CREDENTIAL_KEYS = frozenset({
     "claudeAiOauth",
     "trustedDeviceToken",
     "designOauth",
     "cloudSessionsOauth",
+    "organizationUuid",
+    "trustedDeviceEnrolledAfterRefusalAtMs",
+    "enterpriseGateway",
 })
 
 # Siblings Claude Code may write without any claude.ai login present: the

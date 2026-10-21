@@ -58,6 +58,10 @@ def test_design_oauth_is_account_owned():
     assert "cloudSessionsOauth" in ACCOUNT_CREDENTIAL_KEYS
     assert "designOauth" not in SHARED_CREDENTIAL_KEYS
     assert "cloudSessionsOauth" not in SHARED_CREDENTIAL_KEYS
+    # The rest of what Claude Code's re-login prunes with the login.
+    assert {
+        "organizationUuid", "trustedDeviceEnrolledAfterRefusalAtMs", "enterpriseGateway"
+    } <= ACCOUNT_CREDENTIAL_KEYS
 
 
 class TestHelpers:

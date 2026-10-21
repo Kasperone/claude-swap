@@ -34,6 +34,7 @@ from tests.test_design_oauth_macos import (  # noqa: F401
 )
 from tests.test_design_oauth_per_account import (  # noqa: F401
     TestMigrationMacOS,
+    TestSessionFreshnessMacOS,
 )
 from tests.test_design_oauth_profiles import (  # noqa: F401
     TestEnvVarNamingTheDefaultProfile,

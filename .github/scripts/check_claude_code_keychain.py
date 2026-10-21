@@ -72,9 +72,31 @@ WINDOWS_CHECKS = {
 }
 
 
+RELOGIN_PRUNE = rb"delete \w+\.claudeAiOauth(?:,delete \w+\.\w+)+"
+
+
+def relogin_pruned_keys(data: bytes) -> set[str]:
+    """Keys Claude Code deletes together with claudeAiOauth on a re-login."""
+    match = re.search(RELOGIN_PRUNE, data)
+    if not match:
+        return set()
+    return {key.decode() for key in re.findall(rb"delete \w+\.(\w+)", match.group(0))}
+
+
 def check_binary(label: str, path: str) -> list[str]:
     """Return a failure message per broken expectation (empty when all hold)."""
     data = Path(path).read_bytes()
+    from claude_swap.credentials import ACCOUNT_CREDENTIAL_KEYS
+
+    pruned = relogin_pruned_keys(data)
+    unowned = sorted(pruned - ACCOUNT_CREDENTIAL_KEYS)
+    print(f"{'ok  ' if pruned and not unowned else 'FAIL'} [{label}] re-login "
+          f"pruned keys are all account-owned in cswap: {sorted(pruned)}")
+    prune_failures = [] if pruned and not unowned else [
+        f"[{label}] expectation changed: Claude Code's re-login now prunes "
+        f"{unowned or 'nothing recognisable'}; add account-bound keys to "
+        f"ACCOUNT_CREDENTIAL_KEYS (credentials.py) before trusting this version."
+    ]
     checks = dict(CHECKS)
     if path.lower().endswith(".exe"):
         checks.update(WINDOWS_CHECKS)
@@ -89,7 +111,7 @@ def check_binary(label: str, path: str) -> list[str]:
                 f"storage may have changed; re-verify cswap's Keychain naming "
                 f"against this version before trusting it."
             )
-    return failures
+    return failures + prune_failures
 
 
 def check_cswap() -> None:

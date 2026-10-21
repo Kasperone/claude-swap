@@ -51,11 +51,21 @@ def test_designoauth_ownership_change_is_flagged(tmp_path):
     assert len(failures) == 1 and "re-login deletes designOauth" in failures[0]
 
 
+def test_new_relogin_pruned_key_must_be_account_owned(tmp_path):
+    binary = tmp_path / "claude"
+    binary.write_bytes(GOOD.replace(
+        b"delete e.cloudSessionsOauth,", b"delete e.cloudSessionsOauth,delete e.newLogin,"
+    ))
+    failures = _load().check_binary("v4", str(binary))
+    assert len(failures) == 1 and "newLogin" in failures[0]
+
+
 def test_unrelated_binary_fails_every_check(tmp_path):
     binary = tmp_path / "claude"
     binary.write_bytes(b"nothing here")
     module = _load()
-    assert len(module.check_binary("x", str(binary))) == len(module.CHECKS)
+    # Every pattern, plus the re-login prune list it cannot find.
+    assert len(module.check_binary("x", str(binary))) == len(module.CHECKS) + 1
 
 
 WINDOWS = GOOD + b"""

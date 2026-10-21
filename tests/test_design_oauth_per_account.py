@@ -18,7 +18,6 @@ import pytest
 from claude_swap import macos_keychain, migrations
 from claude_swap import session as session_mod
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, design_fingerprint
-from claude_swap.exceptions import MigrationIncomplete
 from claude_swap.models import Platform
 from claude_swap.session import SessionManager, keychain_service_name, session_dir_for
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -31,7 +30,9 @@ D1_OLD = {"accessToken": "fake-d1-old", "refreshToken": "fake-d1-rt", "expiresAt
 D2 = {"accessToken": "fake-d2-at", "refreshToken": "fake-d2-rt", "expiresAt": 2000}
 D3 = {"accessToken": "fake-d3-at", "refreshToken": "fake-d3-rt", "expiresAt": 2000}
 D4 = {"accessToken": "fake-d4-at", "refreshToken": "fake-d4-rt", "expiresAt": 2000}
-TOKENS = ("fake-d1", "fake-d2", "fake-d3", "fake-d4", "fake-login")
+D5 = {"accessToken": "fake-d5-at", "refreshToken": "fake-d5-rt", "expiresAt": 3000}
+D5_OLD = {"accessToken": "fake-d5-old", "refreshToken": "fake-d5-rt", "expiresAt": 1000}
+TOKENS = ("fake-d1", "fake-d2", "fake-d3", "fake-d4", "fake-d5", "fake-login")
 
 
 def _login(num: str, design: dict | None = None, expires: int = 5000) -> str:
@@ -343,6 +344,12 @@ def _profile(sw: ClaudeAccountSwitcher, num: str, creds: str) -> Path:
     return session_dir
 
 
+def _identity_file(session_dir: Path, num: str) -> None:
+    (session_dir / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {"emailAddress": _email(num), "accountUuid": f"u{num}"}
+    }))
+
+
 def _applied(sw: ClaudeAccountSwitcher) -> dict:
     return migrations._load_applied(sw)
 
@@ -423,22 +430,47 @@ class MigrationScenarios:
         assert self.profile_blob(p4)["designOauth"] == D4
         assert _design(_backup(sw, "4")) == D4
 
-    def test_live_profile_defers_and_retries(self, sw, temp_home, monkeypatch):
+    def test_live_profile_is_marked_then_stripped_once_quiescent(
+        self, sw, temp_home, monkeypatch
+    ):
         self._shared_era(sw, temp_home)
         p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
         monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
 
-        with pytest.raises(MigrationIncomplete):
-            migrations.migrate_design_oauth_per_account(sw)
+        # A running session no longer defers the migration: it completes.
+        assert migrations.migrate_design_oauth_per_account(sw) is True
         migrations.run_migrations(sw)
-        assert "design_oauth_per_account" not in _applied(sw)
+        assert migrations.DESIGN_MIGRATION_ID in _applied(sw)
+        assert _design(_backup(sw, "2")) is None
+        # Not rewritten under the running claude, but ignored from now on.
         assert self.profile_blob(p2)["designOauth"] == D1_OLD
-        assert _design(_backup(sw, "2")) is None  # the backups are done already
+        assert session_mod._profile_design_oauth(p2) is None
+        assert session_mod.foreign_design_fingerprints(p2) == {design_fingerprint(D1)}
+
+        # The session exits: the next adoption strips it, marker gone.
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: True)
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert "designOauth" not in self.profile_blob(p2)
+        assert not session_mod.foreign_design_marker_for(p2).exists()
+        assert _design(_backup(sw, "2")) is None
+
+    def test_marked_profile_keeps_a_design_login_of_its_own_made_since(
+        self, sw, temp_home, monkeypatch
+    ):
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+        migrations.migrate_design_oauth_per_account(sw)
+        # /design-login inside the still-running session: account 2's own.
+        self.profile_put(sw, "2", _login("2", D2))
 
         monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: True)
-        migrations.run_migrations(sw)
-        assert "design_oauth_per_account" in _applied(sw)
-        assert "designOauth" not in self.profile_blob(p2)
+        sw._adopt_session_credential("2", _email("2"), "")
+
+        assert self.profile_blob(p2)["designOauth"] == D2
+        assert _design(_backup(sw, "2")) == D2
 
     def test_idempotent(self, sw, temp_home):
         self._shared_era(sw, temp_home)
@@ -449,27 +481,132 @@ class MigrationScenarios:
         assert migrations.migrate_design_oauth_per_account(sw) is True
         assert {n: _backup(sw, n) for n in ("1", "2", "3", "4")} == before
 
-    def test_without_a_live_copy_shared_families_are_dropped(self, sw, temp_home):
+    def test_duplicate_goes_to_the_active_account(self, sw, temp_home):
         _roster(sw, temp_home, {
-            "1": _login("1", D1),
-            "2": _login("2", D1_OLD),
+            "1": _login("1", D5_OLD),
+            "2": _login("2", D5),
             "3": _login("3", D3),
         }, active="1")
         self.live_put(sw, temp_home, _login("1"))
 
         migrations.migrate_design_oauth_per_account(sw)
 
-        assert _design(_backup(sw, "1")) is None
+        assert _design(_backup(sw, "1")) == D5  # its newest generation
         assert _design(_backup(sw, "2")) is None
         assert _design(_backup(sw, "3")) == D3
 
-    def test_unmanaged_live_login_owns_nothing(self, sw, temp_home):
+    def test_duplicate_goes_to_the_most_recent_capture(self, sw, temp_home):
+        _roster(sw, temp_home, {
+            "1": _login("1"),
+            "2": _login("2", D5_OLD),
+            "3": _login("3", D5),
+        }, active="1")
+
+        migrations.migrate_design_oauth_per_account(sw)
+
+        assert _design(_backup(sw, "1")) is None
+        assert _design(_backup(sw, "2")) is None
+        assert _design(_backup(sw, "3")) == D5
+
+    def test_ambiguous_duplicate_is_kept_everywhere_with_a_warning(
+        self, sw, temp_home, caplog
+    ):
+        _roster(sw, temp_home, {
+            "1": _login("1"),
+            "2": _login("2", D5),
+            "3": _login("3", D5),
+        }, active="1")
+        p3 = self.profile_put(sw, "3", _login("3", D5))
+        caplog.set_level("INFO", logger="claude-swap")
+        before = {n: _backup(sw, n) for n in ("1", "2", "3")}
+
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+
+        assert {n: _backup(sw, n) for n in ("1", "2", "3")} == before
+        assert self.profile_blob(p3)["designOauth"] == D5
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(design_fingerprint(D5) in r.getMessage() for r in warnings)
+        for token in TOKENS:
+            assert token not in caplog.text
+
+    def test_duplicate_in_profiles_of_accounts_with_their_own_is_kept(
+        self, sw, temp_home
+    ):
+        # Both accounts already own another family: neither can take D5
+        # without losing its own, so nothing is removed.
+        _roster(sw, temp_home, {
+            "1": _login("1"),
+            "2": _login("2", D2),
+            "3": _login("3", D3),
+        }, active="1")
+        p2 = self.profile_put(sw, "2", _login("2", D5))
+        p3 = self.profile_put(sw, "3", _login("3", D5))
+
+        migrations.migrate_design_oauth_per_account(sw)
+
+        assert _design(_backup(sw, "2")) == D2
+        assert _design(_backup(sw, "3")) == D3
+        assert self.profile_blob(p2)["designOauth"] == D5
+        assert self.profile_blob(p3)["designOauth"] == D5
+
+    def test_unmanaged_live_login_goes_to_the_active_account(self, sw, temp_home):
         self._shared_era(sw, temp_home)
         _set_identity(temp_home, "9")  # not a managed account
         migrations.migrate_design_oauth_per_account(sw)
-        assert _design(_backup(sw, "1")) is None
+        # The roster's active slot holds the family: it keeps the newest (live).
+        assert _design(_backup(sw, "1")) == D1
         assert _design(_backup(sw, "2")) is None
         assert _design(_backup(sw, "3")) == D3
+
+    def test_one_shot_even_with_a_live_session(self, sw, temp_home, monkeypatch):
+        self._shared_era(sw, temp_home)
+        self.profile_put(sw, "2", _login("2", D1_OLD))
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+        calls = []
+        real = migrations._assign_design_oauth
+        monkeypatch.setattr(
+            migrations, "_assign_design_oauth",
+            lambda *a: (calls.append(1), real(*a))[1],
+        )
+
+        for _ in range(3):
+            migrations.run_migrations(sw)
+
+        assert calls == [1]
+        assert migrations.DESIGN_MIGRATION_ID in _applied(sw)
+        state = sw.backup_dir / ".migrations.json"
+        assert json.loads(state.read_text())["applied"][migrations.DESIGN_MIGRATION_ID]
+        assert not list(sw.backup_dir.glob("*.tmp"))  # atomic write, no leftovers
+
+    def test_already_recorded_under_the_lock_runs_nothing(self, sw, temp_home, monkeypatch):
+        self._shared_era(sw, temp_home)
+        migrations._mark_applied(sw, migrations.DESIGN_MIGRATION_ID)
+        monkeypatch.setattr(
+            migrations, "_assign_design_oauth",
+            lambda *a: pytest.fail("ran although recorded"),
+        )
+        # Called directly, as a second process that waited for the lock would.
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+        assert _design(_backup(sw, "2")) == D1_OLD
+
+    def test_version_bump_runs_it_again(self, sw, temp_home, monkeypatch):
+        self._shared_era(sw, temp_home)
+        migrations.run_migrations(sw)
+        # A copy appears after the first run (e.g. restored from a backup).
+        sw._store._write_account_credentials("2", _email("2"), _login("2", D1_OLD))
+        migrations.run_migrations(sw)
+        assert _design(_backup(sw, "2")) == D1_OLD  # recorded: not re-run
+
+        bumped = f"design_oauth_per_account.v{migrations.DESIGN_MIGRATION_VERSION + 1}"
+        monkeypatch.setattr(migrations, "DESIGN_MIGRATION_ID", bumped)
+        monkeypatch.setattr(migrations, "MIGRATIONS", [
+            (i, f) if f is not migrations.migrate_design_oauth_per_account
+            else (bumped, f)
+            for i, f in migrations.MIGRATIONS
+        ])
+        migrations.run_migrations(sw)
+        assert bumped in _applied(sw)
+        assert _design(_backup(sw, "2")) is None
 
 
 def session_dir_creds(session_dir: Path) -> str:
@@ -487,7 +624,7 @@ class TestMigrationLinux(MigrationScenarios):
     def live_get(self, sw, home):
         return _live_file(home).read_text()
 
-    def test_api_key_live_owns_none(self, sw, temp_home):
+    def test_api_key_live_goes_to_the_most_recent_capture(self, sw, temp_home):
         self._shared_era(sw, temp_home)
         sw.add_account_from_token(API_KEY, slot=5)
         sw.switch_to("5", json_output=True)
@@ -496,7 +633,8 @@ class TestMigrationLinux(MigrationScenarios):
 
         migrations.migrate_design_oauth_per_account(sw)
 
-        assert _design(_backup(sw, "1")) is None
+        # The key owns none; slot 1 captured the newest generation last.
+        assert _design(_backup(sw, "1")) == D1
         assert _design(_backup(sw, "2")) is None
         assert _design(_backup(sw, "3")) == D3
         assert sw._read_account_credentials("5", "api-key-5@token.local") == API_KEY
@@ -511,13 +649,13 @@ class TestMigrationLinux(MigrationScenarios):
 
         migrations.run_migrations(sw)
 
-        assert "design_oauth_per_account" not in _applied(sw)
+        assert migrations.DESIGN_MIGRATION_ID not in _applied(sw)
         assert {n: _backup(sw, n) for n in ("1", "2", "3", "4")} == before
 
     def test_runs_once_at_construction(self, sw, temp_home, monkeypatch):
         self._shared_era(sw, temp_home)
         _platform(monkeypatch, Platform.LINUX)  # constructs: runs migrations
-        assert "design_oauth_per_account" in _applied(sw)
+        assert migrations.DESIGN_MIGRATION_ID in _applied(sw)
         assert _design(_backup(sw, "2")) is None
 
     def test_fresh_install_is_not_marked(self, sw):
@@ -608,3 +746,112 @@ class TestMigrationMacOS(MigrationScenarios):
         assert self.keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == live_before
         # A re-seed keeps it, from the item, into the plaintext seed.
         assert json.loads(session_dir_creds(_bootstrap(sw, "2")))["designOauth"] == D2
+
+
+D2_NEWER = {**D2, "accessToken": "fake-d2-newer", "expiresAt": 9000}
+D2_OLDER = {**D2, "accessToken": "fake-d2-older", "expiresAt": 1}
+
+
+class SessionFreshnessScenarios:
+    """A session profile's Design login is never dropped or overwritten by an
+    older copy when cswap invalidates, re-seeds or cleans the profile up.
+    Subclasses say where Claude Code keeps the profile's credential."""
+
+    def profile_write(self, session_dir: Path, creds: str) -> None:
+        (session_dir / ".credentials.json").write_text(creds)
+
+    def _setup(self, sw, home, backup_design=D2, profile_design=D2_NEWER):
+        _roster(sw, home, {"1": _login("1", D1), "2": _login("2", backup_design)},
+                active="1")
+        session_dir = _bootstrap(sw, "2")
+        _identity_file(session_dir, "2")
+        blob = json.loads(session_dir_creds(session_dir))
+        blob["designOauth"] = profile_design
+        self.profile_write(session_dir, json.dumps(blob))
+        return session_dir
+
+    def test_backup_rewrite_keeps_the_newer_session_design(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home)
+        # e.g. account 2 re-captured from the default login: the switcher's
+        # writer invalidates the quiescent profile afterwards.
+        sw._write_account_credentials("2", _email("2"), _login("2", D2))
+
+        assert _design(_backup(sw, "2")) == D2_NEWER
+        assert not (session_dir / ".credentials.json").exists()
+        # The re-seed carries it back.
+        assert json.loads(session_dir_creds(_bootstrap(sw, "2")))["designOauth"] == (
+            D2_NEWER
+        )
+
+    def test_older_session_design_never_overwrites_the_backup(self, sw, temp_home):
+        self._setup(sw, temp_home, backup_design=D2, profile_design=D2_OLDER)
+        sw._write_account_credentials("2", _email("2"), _login("2", D2))
+        assert _design(_backup(sw, "2")) == D2
+
+    def test_stale_marked_profile_still_keeps_its_newer_design(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home)
+        session_mod.mark_session_stale(session_dir)
+
+        sw._invalidate_session_credentials("2", _email("2"))
+
+        assert _design(_backup(sw, "2")) == D2_NEWER
+
+    def test_failed_validation_cleanup_keeps_the_newer_design(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home, backup_design=None)
+
+        SessionManager(sw)._cleanup_failed_session(session_dir, "2", _email("2"), "")
+
+        assert not session_dir.exists()
+        assert _design(_backup(sw, "2")) == D2_NEWER
+
+    def test_reseed_never_takes_an_older_backup_copy(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home, backup_design=D2_OLDER)
+        assert json.loads(session_dir_creds(_bootstrap(sw, "2")))["designOauth"] == (
+            D2_NEWER
+        )
+        del session_dir
+
+    def test_marked_foreign_copy_is_never_carried(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home, backup_design=None,
+                                  profile_design=D1)
+        session_mod.mark_foreign_design(session_dir, design_fingerprint(D1))
+
+        sw._write_account_credentials("2", _email("2"), _login("2"))
+
+        assert _design(_backup(sw, "2")) is None
+        assert not session_mod.foreign_design_marker_for(session_dir).exists()
+
+    def test_backup_one_family_profile_another_is_compared_by_expiry(
+        self, sw, temp_home
+    ):
+        # A fresh /design-login in the session (new family, later expiry).
+        fresh = {**D3, "expiresAt": 9500}
+        self._setup(sw, temp_home, backup_design=D2, profile_design=fresh)
+        assert sw._adopt_session_credential("2", _email("2"), "") is False
+        assert _design(_backup(sw, "2")) == fresh
+
+
+class TestSessionFreshnessLinux(SessionFreshnessScenarios):
+    @pytest.fixture
+    def sw(self, linux):
+        return linux
+
+
+class TestSessionFreshnessWindows(SessionFreshnessScenarios):
+    @pytest.fixture
+    def sw(self, temp_home, monkeypatch):
+        return _platform(monkeypatch, Platform.WINDOWS)
+
+
+@pytest.mark.no_keychain_fake
+@pytest.mark.skipif(sys.platform == "win32", reason="fake security is a POSIX script")
+class TestSessionFreshnessMacOS(SessionFreshnessScenarios):
+    """Claude Code keeps the session's rotated blob in the hashed item."""
+
+    @pytest.fixture
+    def sw(self, temp_home, keychain, monkeypatch):  # noqa: F811
+        self.keychain = keychain
+        return _platform(monkeypatch, Platform.MACOS)
+
+    def profile_write(self, session_dir, creds):
+        self.keychain.put(keychain_service_name(session_dir), creds)

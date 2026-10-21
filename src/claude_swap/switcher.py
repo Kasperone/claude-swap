@@ -2789,6 +2789,7 @@ class ClaudeAccountSwitcher:
         an existing profile (e.g. --import --force).
         """
         from claude_swap.session import (
+            clear_foreign_design,
             clear_session_stale,
             delete_macos_keychain_entry,
         )
@@ -2796,12 +2797,30 @@ class ClaudeAccountSwitcher:
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
+        # The profile may hold a newer Design login of this account than
+        # the backup (a /design-login not adopted yet): keep it in the
+        # backup before the profile's credential material goes.
+        try:
+            self._adopt_session_design(
+                account_num, email, self._slot_org_uuid(account_num)
+            )
+        except Exception as e:  # never block the invalidation itself
+            self._logger.warning(
+                f"Could not keep account {account_num}'s session Design login: {e}"
+            )
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
+        clear_foreign_design(session_dir)
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )
+
+    def _slot_org_uuid(self, account_num: str) -> str:
+        """The slot's stored organization uuid ("" when unknown)."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        return record.get("organizationUuid") or ""
 
     def _session_profile_ahead(
         self, account_num: str, email: str, org_uuid: str
@@ -2897,12 +2916,21 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
-        from claude_swap.session import profile_is_quiescent, read_session_identity
+        from claude_swap.session import (
+            own_design_oauth,
+            profile_is_quiescent,
+            read_session_identity,
+            settle_foreign_design,
+        )
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
             if not profile_is_quiescent(session_dir):
                 return None
+            # Another account's Design login the migration found in the
+            # profile while it was live: strip it now, before anything reads
+            # the profile for this account.
+            settle_foreign_design(session_dir)
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
                 self._adopt_session_design(account_num, email, org_uuid)
@@ -2914,7 +2942,10 @@ class ClaudeAccountSwitcher:
             backup = self._store._read_account_credentials(account_num, email)
             profile = with_design_oauth(
                 profile,
-                newer_design_oauth(design_oauth_of(profile), design_oauth_of(backup)),
+                newer_design_oauth(
+                    own_design_oauth(session_dir, design_oauth_of(profile)),
+                    design_oauth_of(backup),
+                ),
             )
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
@@ -2933,22 +2964,23 @@ class ClaudeAccountSwitcher:
         generation check of :meth:`_adopt_session_credential` never sees it.
         designOauth is account-owned: the profile's copy is this account's,
         and it goes into this slot's backup only — never the default store or
-        another slot. Written when the backup has none or an older generation;
-        the backup's login is kept verbatim. Same evidence bar as the login
-        adoption (caller holds cswap's lock and checked quiescence): the
-        profile must be readable as this account and not stale-marked, and an
-        unreadable backup writes nothing. Returns whether it wrote.
+        another slot. Written only when the backup has none or a strictly older
+        generation (``expiresAt``), so a newer copy is never overwritten with
+        an older one; the backup's login is kept verbatim. A stale-marked
+        profile still qualifies: the marker is about the login, and freshness
+        is compared here. Callers checked quiescence (and hold cswap's lock,
+        or are invalidating the profile under it): the profile must be
+        readable as this account, a copy marked as another account's is
+        ignored, and an unreadable backup writes nothing. Returns whether it
+        wrote.
         """
         from claude_swap.session import (
             _profile_design_oauth,
-            is_session_stale,
             read_session_identity,
             session_identity_drifted,
         )
 
         session_dir = self._session_dir(account_num, email)
-        if is_session_stale(session_dir):
-            return False
         profile_design = _profile_design_oauth(session_dir)
         if profile_design is None:
             return False
@@ -2985,11 +3017,13 @@ class ClaudeAccountSwitcher:
         slot+email inherits a re-bootstrap flag nothing set for it.
         """
         from claude_swap.session import (
+            clear_foreign_design,
             clear_session_stale,
             delete_macos_keychain_entry,
         )
 
         session_dir = self._session_dir(account_num, email)
+        clear_foreign_design(session_dir)
         if session_dir.exists():
             delete_macos_keychain_entry(session_dir)
             shutil.rmtree(session_dir, ignore_errors=True)
