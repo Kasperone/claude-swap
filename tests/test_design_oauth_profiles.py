@@ -365,3 +365,44 @@ class TestSessionProfileKeychain:
         seeded = json.loads((session_dir / ".credentials.json").read_text())
         assert seeded["claudeAiOauth"] == {"accessToken": "fake-backup"}
         assert seeded["designOauth"] == SESSION_DESIGN
+
+
+class TestReviewFindingsSession:
+    """Review finding R5: a re-seed keeps a designOauth-only profile blob, and
+    an existing hashed item is authoritative over the older plaintext seed."""
+
+    def test_r5_design_only_profile_file_survives_reseed(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.LINUX
+        _seed_slot(sw, _login("fake-backup"))
+        session_dir = sw.backup_dir / "sessions" / "1-a-x-com"
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({"designOauth": SESSION_DESIGN})
+        )
+
+        SessionManager(sw)._bootstrap(session_dir, "1", "a@x.com", "")
+
+        seeded = json.loads((session_dir / ".credentials.json").read_text())
+        assert seeded["designOauth"] == SESSION_DESIGN
+
+    @posix_only
+    @pytest.mark.no_keychain_fake
+    def test_r5_hashed_item_without_design_beats_stale_seed(
+        self, temp_home, keychain, monkeypatch  # noqa: F811
+    ):
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
+        sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.MACOS
+        backup = _login("fake-backup")
+        _seed_slot(sw, backup)
+        session_dir = sw.backup_dir / "sessions" / "1-a-x-com"
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(
+            _login("fake-old-seed", designOauth={"accessToken": "stale"})
+        )
+        keychain.put(keychain_service_name(session_dir), _login("fake-rotated"))
+
+        SessionManager(sw)._bootstrap(session_dir, "1", "a@x.com", "")
+
+        assert (session_dir / ".credentials.json").read_text() == backup

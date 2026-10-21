@@ -290,3 +290,93 @@ def test_account_name_falls_back_like_claude_code(monkeypatch):
     assert macos_keychain.keychain_account_name() == "claude-code-user"
     monkeypatch.setenv("USER", "ok.user-1_x")
     assert macos_keychain.keychain_account_name() == "ok.user-1_x"
+
+
+class TestReviewFindingsKeychain:
+    """Review findings R1 and R2 on the fake-security Keychain."""
+
+    def test_r1_design_kept_by_in_place_update(self, switcher, keychain, monkeypatch):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        deleted = []
+        real_delete = macos_keychain.delete_password
+        monkeypatch.setattr(
+            macos_keychain,
+            "delete_password",
+            lambda svc, acct: (deleted.append(svc), real_delete(svc, acct))[1],
+        )
+
+        switcher._store._clear_oauth_credential()
+
+        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {"designOauth": DESIGN}
+        assert CLAUDE_CODE_KEYCHAIN_SERVICE not in deleted  # never a both-gone window
+
+    def test_r1_refused_design_update_still_removes_the_login(
+        self, switcher, keychain, monkeypatch
+    ):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
+
+        switcher._store._clear_oauth_credential()
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+
+    def test_r2_graft_reads_once_and_only_after_a_failed_write(
+        self, switcher, keychain, monkeypatch, temp_home
+    ):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
+        reads = []
+        real_get = macos_keychain.get_password
+        monkeypatch.setattr(
+            macos_keychain,
+            "get_password",
+            lambda svc, acct: (reads.append(svc), real_get(svc, acct))[1],
+        )
+
+        switcher._store._write_oauth_credentials(_login("fake-target"))
+
+        assert reads == [CLAUDE_CODE_KEYCHAIN_SERVICE]
+        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert written["designOauth"] == DESIGN
+
+    def test_r2_unreadable_item_is_read_once_without_retry(
+        self, switcher, keychain, monkeypatch, temp_home
+    ):
+        monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
+        reads = []
+
+        def unreadable(svc, acct):
+            reads.append(svc)
+            raise macos_keychain.KeychainError("timed out")
+
+        monkeypatch.setattr(macos_keychain, "get_password", unreadable)
+        target = _login("fake-target")
+
+        switcher._store._write_oauth_credentials(target)
+
+        assert len(reads) == 1
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == target
+
+    def test_r2_no_keychain_read_when_already_known_unusable(
+        self, switcher, keychain, monkeypatch
+    ):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        switcher._store._pin_file_mode(residual_cleared=True)
+        reads = []
+        monkeypatch.setattr(
+            macos_keychain,
+            "get_password",
+            lambda svc, acct: reads.append(svc),
+        )
+
+        switcher._store._write_oauth_credentials(_login("fake-target"))
+
+        assert reads == []

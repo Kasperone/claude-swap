@@ -233,8 +233,9 @@ SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpXaaIdp",
     "mcpXaaIdpConfig",
     "pluginSecrets",
-    # Claude Design login: tied to the machine's Claude Code install, not to
-    # a swapped account slot, so a switch must never drop or replace it.
+    # Claude Design login: Claude Code keeps it in the same secure-storage
+    # blob as claudeAiOauth but it belongs to the profile, not to the swapped
+    # account slot, so a switch must never drop or replace it.
     "designOauth",
 })
 
@@ -301,22 +302,28 @@ def merge_shared_credential_fields(
     return json.dumps(composed)
 
 
-def is_design_only(credentials: str | None) -> bool:
-    """Whether a stored blob holds only ``designOauth`` and no login.
+def is_login_less(credentials: str | None) -> bool:
+    """Whether a stored blob holds only machine-shared fields and no login.
 
-    That is the residue left when a managed API key is activated: the OAuth
-    login is gone but ``designOauth`` is kept. It is not a credential, so the
-    active-credential reader must see past it to the managed key.
+    The residue an API-key activation leaves (``designOauth`` kept, the login
+    removed) — and any shared field Claude Code adds to it afterwards, since it
+    rewrites the whole blob (``mcpOAuth`` for an MCP server authorised while the
+    key is active). Not a credential: the active reader prefers a managed key
+    over it, and capture never takes it for an account's login.
     """
     data = _credential_object(credentials)
-    return bool(data) and set(data) == {"designOauth"}
+    return (
+        bool(data)
+        and "claudeAiOauth" not in data
+        and set(data) <= SHARED_CREDENTIAL_KEYS
+    )
 
 
 def with_design_oauth(target_credentials: str, design: dict) -> str:
-    """Add the machine's ``designOauth`` to a target Claude login.
+    """Add a ``designOauth`` to a target Claude login, the rest verbatim.
 
-    Used when the live credential is a managed API key, where the rest of the
-    target stays verbatim. Unchanged when the target is not a Claude login.
+    Used by a session re-seed, which keeps the profile's own Design login over
+    the backup's copy. Unchanged when the target is not a Claude login.
     """
     target = _credential_object(target_credentials)
     if target is None or "claudeAiOauth" not in target:
@@ -639,6 +646,9 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
+        # A login-less blob (see is_login_less) is held back: a managed key
+        # found in step 3 is the active credential, not that residue.
+        residue: ActiveCredentials | None = None
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         #
         # READ THE ITEM FOR *THIS* PROFILE, NOT THE FIXED NAME.
@@ -666,7 +676,9 @@ class CredentialStore:
             # item cannot erase it. Sticky until this read succeeds again,
             # which is what makes it self-heal without being erasable.
             self._active_read_failed = keychain_failed
-            if val and not is_design_only(val):
+            if val and is_login_less(val):
+                residue = ActiveCredentials(val, False)
+            elif val:
                 return ActiveCredentials(val, False)
         elif self._residual_verdict is False or (
             self._active_read_failed or self._keychain_unreadable
@@ -694,13 +706,19 @@ class CredentialStore:
                 # there is; hardcoding False made it render as "no credentials"
                 # and sent the user to a re-login that cannot help.
                 return ActiveCredentials(None, keychain_failed, keychain_failed)
-            if text.strip() and not is_design_only(text):
+            if text.strip() and is_login_less(text):
+                residue = residue or ActiveCredentials(text, False, keychain_failed)
+            elif text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
+        if residue is not None:
+            # Login-less shared state and no key: upstream's live-state answer
+            # (the switch composes its shared fields), unchanged.
+            return residue
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed, keychain_failed)
@@ -824,7 +842,7 @@ class CredentialStore:
                 pass
             raise
 
-    def _delete_active_keychain_entry(self) -> bool:
+    def _delete_active_keychain_entry(self, keep: str | None = None) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
 
         Claude Code reads the Keychain before the plaintext file, so once we fall
@@ -842,8 +860,11 @@ class CredentialStore:
         cleared = True
         # The ACTIVE profile's item(s) only: the unsuffixed default-profile item
         # when no profile env var is set, claude's hashed item under
-        # CLAUDE_CONFIG_DIR — never another profile's.
+        # CLAUDE_CONFIG_DIR — never another profile's. ``keep`` is an item just
+        # rewritten to a login-less blob, which cannot shadow anything.
         for service in _active_oauth_keychain_services():
+            if service == keep:
+                continue
             try:
                 macos_keychain.delete_password(
                     service, macos_keychain.keychain_account_name()
@@ -1029,35 +1050,46 @@ class CredentialStore:
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
 
-        The machine-shared ``designOauth`` is not part of that login: it is read
-        before the delete and written back alone, to each store it was found in.
+        The machine-shared ``designOauth`` is not part of that login. Where a
+        store holds it, the store is overwritten in place with a
+        designOauth-only blob (Keychain ``-U`` update, atomic file rename), so a
+        failed write never leaves both gone; only if that write fails is the
+        store deleted as before — the login must not shadow the key.
         """
         design_kc = self._design_oauth_in_keychain()
-        write_service = self._active_write_service() if design_kc else None
-        self._delete_active_keychain_entry()
-        cred_file = get_credentials_path()
-        design_file: dict = {}
-        try:
-            if cred_file.exists():
-                design_file = self._machine_shared_remainder(cred_file)
-                cred_file.unlink()
-        except OSError as e:
-            self._host._logger.warning(f"Failed to remove credentials file: {e}")
-        if design_file:
-            try:
-                self._write_active_credentials_file(json.dumps(design_file))
-            except Exception as e:
-                self._host._logger.warning(f"Failed to keep designOauth in file: {e}")
+        kept_service = None
         if design_kc:
+            kept_service = self._active_write_service()
             try:
                 self._kc_call(
                     macos_keychain.set_password,
-                    write_service,
+                    kept_service,
                     macos_keychain.keychain_account_name(),
                     json.dumps(design_kc),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                self._host._logger.warning(f"Failed to keep designOauth in Keychain: {e}")
+                kept_service = None
+                self._host._logger.warning(
+                    f"Could not keep designOauth in the Keychain, removing the item: {e}"
+                )
+        self._delete_active_keychain_entry(keep=kept_service)
+
+        cred_file = get_credentials_path()
+        try:
+            if not cred_file.exists():
+                return
+            design_file = self._machine_shared_remainder(cred_file)
+            if design_file:
+                try:
+                    self._write_active_credentials_file(json.dumps(design_file))
+                    return
+                except Exception as e:
+                    self._host._logger.warning(
+                        f"Could not keep designOauth in the credentials file, removing it: {e}"
+                    )
+            cred_file.unlink()
+        except OSError as e:
+            self._host._logger.warning(f"Failed to remove credentials file: {e}")
 
     def _design_oauth_in_keychain(self) -> dict:
         """``designOauth`` held by the active profile's OAuth Keychain item.
@@ -1075,19 +1107,26 @@ class CredentialStore:
             return {"designOauth": data["designOauth"]}
         return {}
 
-    def residual_design_oauth(self) -> dict | None:
-        """``designOauth`` left behind by an API-key activation, else ``None``.
+    def residual_shared_fields(self) -> dict | None:
+        """Shared fields of the login-less residue an API-key activation left.
 
-        Looked up in the Keychain item and the plaintext file. Lets the next
-        API-key -> OAuth switch carry it over even though the live credential
-        is then a raw API key, which has no JSON object to take it from.
+        ``None`` when the active store holds no such residue (no item/file, or a
+        full login — a plaintext login file may be a stale generation and is not
+        consulted). Lets the next API-key -> OAuth switch keep the live
+        ``designOauth`` (and any shared field Claude Code added since), although
+        the live credential is then a raw API key with no JSON object to take
+        them from.
         """
-        found = self._design_oauth_in_keychain()
-        if not found:
-            cred_file = get_credentials_path()
-            if cred_file.exists():
-                found = self._machine_shared_remainder(cred_file)
-        return found.get("designOauth") if found else None
+        if self._use_keychain():
+            value, _failed = self._read_active_oauth_keychain()
+            if is_login_less(value):
+                return shared_credential_fields(value)
+        cred_file = get_credentials_path()
+        try:
+            text = cred_file.read_text(encoding="utf-8") if cred_file.exists() else None
+        except OSError:
+            return None
+        return shared_credential_fields(text) if is_login_less(text) else None
 
     @staticmethod
     def _machine_shared_remainder(cred_file: Path) -> dict:
@@ -1124,11 +1163,13 @@ class CredentialStore:
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
+        failed_service = None
         if self._use_keychain():
+            service = self._active_write_service()
             try:
                 self._kc_call(
                     macos_keychain.set_password,
-                    self._active_write_service(),
+                    service,
                     macos_keychain.keychain_account_name(),
                     credentials,
                 )
@@ -1136,6 +1177,7 @@ class CredentialStore:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
+                failed_service = service
             else:
                 # Keychain (primary) now holds the fresh credential. Bump an
                 # already-present shadow file's mtime so running sessions hot-reload
@@ -1148,7 +1190,8 @@ class CredentialStore:
         # that just failed. Write the plaintext file and (macOS) best-effort clear
         # any stale Keychain entry so Claude Code's keychain-first read can't shadow
         # it (#30337).
-        credentials = self._with_keychain_shared_fields(credentials)
+        if failed_service is not None:
+            credentials = self._with_keychain_shared_fields(credentials, failed_service)
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1163,23 +1206,27 @@ class CredentialStore:
             self._pin_file_mode(residual_cleared=cleared)
         self._last_active_credentials_backend = "file"
 
-    def _with_keychain_shared_fields(self, credentials: str) -> str:
+    def _with_keychain_shared_fields(self, credentials: str, service: str) -> str:
         """Carry the Keychain item's machine-shared fields into a file-mode write.
 
-        The file fallback is followed by deleting the active Keychain item (it
-        would otherwise shadow the file). That item may hold ``designOauth`` and
-        the other ``SHARED_CREDENTIAL_KEYS`` the incoming credential lacks —
-        e.g. when the Keychain was unreadable while the switch composed it — so
-        read them first and add only the ones that are absent. Best-effort: an
-        unreadable item leaves ``credentials`` as given.
+        Called only when this write just failed against ``service``. The file
+        fallback is followed by deleting that item (it would otherwise shadow
+        the file), and the item may hold ``designOauth`` and the other
+        ``SHARED_CREDENTIAL_KEYS`` the incoming credential lacks — e.g. when the
+        Keychain was unreadable while the switch composed it — so read them
+        first and add only the ones that are absent.
+
+        One direct read (one timeout, no retry, not via ``_kc_call``): the write
+        has already failed, and this must neither stretch the fallback nor
+        re-record Keychain usability. Unreadable leaves ``credentials`` as given.
         """
-        if self._host.platform != Platform.MACOS:
-            return credentials
         target = _credential_object(credentials)
         if target is None or "claudeAiOauth" not in target:
             return credentials
         try:
-            item, _failed = self._read_active_oauth_keychain()
+            item = macos_keychain.get_password(
+                service, macos_keychain.keychain_account_name()
+            )
         except macos_keychain.KEYCHAIN_ERRORS:
             return credentials
         carried = {

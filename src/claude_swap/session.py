@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.credentials import is_design_only, with_design_oauth
+from claude_swap.credentials import is_login_less, with_design_oauth
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -280,6 +280,30 @@ def _design_oauth_of(credentials: str | None) -> dict | None:
     return design if isinstance(design, dict) else None
 
 
+def _profile_design_oauth(session_dir: Path) -> dict | None:
+    """The profile's own ``designOauth``, from its hashed item(s) then its file.
+
+    Read raw, unlike :func:`read_config_dir_credentials`, which skips a
+    login-less blob: a profile that holds only its Design login must keep it.
+    The first existing item is authoritative (claude reads it before the
+    plaintext seed, which may be older). Best-effort — an unreadable store
+    answers ``None``.
+    """
+    if Platform.detect() == Platform.MACOS:
+        for service in _keychain_services(str(session_dir)):
+            try:
+                value = _keychain_entry(service, strict=False)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return None
+            if value is not None:
+                return _design_oauth_of(value)
+    try:
+        text = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return _design_oauth_of(text)
+
+
 def read_session_credentials(session_dir: Path) -> str | None:
     """Best-effort read of a session profile's *current* credential JSON.
 
@@ -448,13 +472,13 @@ def read_config_dir_credentials(
                         f"(locked or busy) — unlock the keychain and retry: {e}"
                     ) from e
                 break  # best-effort read: the plaintext seed is the next-best truth
-            if creds and not is_design_only(creds):
+            if creds and not is_login_less(creds):
                 return creds
-            # entry absent (rc 44), or only the profile's designOauth is left
-            # after an API-key activation — claude's own signal to look further
+            # entry absent (rc 44), or login-less shared state only (e.g. the
+            # designOauth an API-key activation kept) — look further
     try:
         text = (directory / ".credentials.json").read_text(encoding="utf-8")
-        return None if is_design_only(text) else text
+        return None if is_login_less(text) else text
     except (OSError, ValueError):
         # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
         # readable credential material", not an error to propagate.
@@ -899,7 +923,7 @@ class SessionManager:
         # The profile's own Claude Design login (designOauth) lives in the
         # profile's store, not the backup: read it before the delete below
         # removes the hashed item, and carry it into the seed.
-        profile_design = _design_oauth_of(read_session_credentials(session_dir))
+        profile_design = _profile_design_oauth(session_dir)
 
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.

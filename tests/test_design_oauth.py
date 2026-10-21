@@ -119,7 +119,7 @@ class TestSwap:
 
 
 class TestAddRemovePurge:
-    def test_add_account_leaves_live_design_oauth(self, temp_home, monkeypatch):
+    def test_add_account_leaves_live_design_oauth(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         live = _live(temp_home, designOauth=DESIGN)
@@ -131,14 +131,9 @@ class TestAddRemovePurge:
                 "organizationName": "",
             }
         }))
-        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
-        try:
-            switcher.add_account()
-        except SystemExit:
-            pass
-        assert json.loads(_cred_file(temp_home).read_text())[
-            "designOauth"
-        ] == DESIGN
+        switcher.add_account()
+
+        assert "a@x.com" in json.dumps(switcher._get_sequence_data()["accounts"])
         assert _cred_file(temp_home).read_text() == live
 
     def test_remove_account_leaves_live_design_oauth(self, temp_home, monkeypatch):
@@ -188,3 +183,80 @@ class TestApiKeyResidue:
         written = json.loads(_cred_file(temp_home).read_text())
         assert written["designOauth"] == DESIGN
         assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
+
+
+class TestReviewFindingsFile:
+    """Review findings R1, R3 and R4 on the file backend."""
+
+    def test_r1_failed_design_rewrite_still_removes_the_login(
+        self, temp_home, monkeypatch
+    ):
+        switcher = ClaudeAccountSwitcher()
+        _live(temp_home, designOauth=DESIGN)
+
+        def refuse(self, creds):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            type(switcher._store), "_write_active_credentials_file", refuse
+        )
+        switcher._store._clear_oauth_credential()
+
+        assert not _cred_file(temp_home).exists()
+
+    def test_r3_residue_with_added_shared_key_does_not_mask_the_key(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        _live(temp_home, designOauth=DESIGN)
+        switcher._write_credentials(API_KEY)
+        # Claude Code rewrites the whole blob, e.g. after an MCP authorisation.
+        mcp = {"server": {"refreshToken": "fake-mcp"}}
+        _cred_file(temp_home).write_text(
+            json.dumps({"designOauth": DESIGN, "mcpOAuth": mcp})
+        )
+
+        assert switcher._read_credentials() == API_KEY
+
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "fake-target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        switcher._write_credentials(
+            switcher._prepare_credentials_for_activation(
+                target, switcher._read_credentials()
+            )
+        )
+        written = json.loads(_cred_file(temp_home).read_text())
+        assert written["designOauth"] == DESIGN
+        assert written["mcpOAuth"] == mcp
+        assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
+
+    def test_r3_login_less_blob_without_a_key_is_still_live_state(self, temp_home):
+        # Upstream's behaviour: with no managed key, the login-less blob is
+        # what the switch composes shared fields from.
+        switcher = ClaudeAccountSwitcher()
+        blob = json.dumps({"mcpOAuth": {"server": {"refreshToken": "current"}}})
+        _cred_file(temp_home).write_text(blob)
+
+        assert switcher._read_credentials() == blob
+
+    def test_r3_capture_never_takes_a_residue_for_a_login(self, temp_home):
+        from claude_swap.session import read_config_dir_credentials
+
+        profile = temp_home / "p"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps({
+            "designOauth": DESIGN,
+            "mcpOAuth": {"server": {"refreshToken": "x"}},
+        }))
+
+        assert read_config_dir_credentials(str(profile)) is None
+
+    def test_r4_stale_login_file_is_not_a_residue_source(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        _live(temp_home, designOauth={"accessToken": "stale-file-copy"})
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "fake-target"},
+            "designOauth": DESIGN,
+        })
+
+        assert switcher._prepare_credentials_for_activation(target, None) == target

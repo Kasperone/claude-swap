@@ -51,7 +51,6 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
-    with_design_oauth,
 )
 from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
@@ -765,18 +764,17 @@ class ClaudeAccountSwitcher:
         account-bound state such as ``trustedDeviceToken`` — and any field
         cswap does not recognize — must not leak across an account switch.
 
-        When there is no live JSON credential object to take shared fields
-        from (fresh machine, or a managed API key is active), the stored
-        blob activates unchanged, exactly as before.
+        When there is no live JSON credential object (fresh machine, or a
+        managed API key is active), the shared fields come from the login-less
+        residue an API-key activation leaves in the active store (it keeps
+        ``designOauth``); with no residue the stored blob activates unchanged,
+        exactly as before.
         """
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:
-            # A managed API key (or nothing) is live. The target stays verbatim
-            # except for the Design login an earlier API-key switch kept aside.
-            design = self._store.residual_design_oauth()
-            if design is None:
+            live_shared = self._store.residual_shared_fields()
+            if live_shared is None:
                 return target_credentials
-            return with_design_oauth(target_credentials, design)
         return merge_shared_credential_fields(target_credentials, live_shared)
 
     def _uses_file_backup_backend(self) -> bool:
