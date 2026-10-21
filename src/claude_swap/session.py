@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.credentials import with_design_oauth
+from claude_swap.credentials import is_design_only, with_design_oauth
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -448,11 +448,13 @@ def read_config_dir_credentials(
                         f"(locked or busy) — unlock the keychain and retry: {e}"
                     ) from e
                 break  # best-effort read: the plaintext seed is the next-best truth
-            if creds:
+            if creds and not is_design_only(creds):
                 return creds
-            # entry absent (rc 44) — claude's own signal to look further
+            # entry absent (rc 44), or only the profile's designOauth is left
+            # after an API-key activation — claude's own signal to look further
     try:
-        return (directory / ".credentials.json").read_text(encoding="utf-8")
+        text = (directory / ".credentials.json").read_text(encoding="utf-8")
+        return None if is_design_only(text) else text
     except (OSError, ValueError):
         # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
         # readable credential material", not an error to propagate.

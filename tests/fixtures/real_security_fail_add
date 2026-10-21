@@ -1,0 +1,23 @@
+#!/bin/sh
+# Real macOS ``security`` against the runner's real $HOME, except that every
+# add-generic-password (stdin ``-i`` form or argv form) is refused with a
+# non-zero exit, as a denied/locked Keychain write would be. Reads and deletes
+# hit the real throwaway keychain.
+REAL="${CSWAP_SECURITY_BIN:-/usr/bin/security}"
+export HOME="$CSWAP_REAL_HOME"
+if [ "$1" = "-i" ]; then
+    INPUT=$(cat)
+    case "$INPUT" in
+        add-generic-password*)
+            echo "security: write refused (test)" >&2
+            exit 45
+            ;;
+    esac
+    printf '%s\n' "$INPUT" | "$REAL" -i
+    exit $?
+fi
+if [ "$1" = "add-generic-password" ]; then
+    echo "security: write refused (test)" >&2
+    exit 45
+fi
+exec "$REAL" "$@"

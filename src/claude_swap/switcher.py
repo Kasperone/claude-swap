@@ -741,11 +741,12 @@ class ClaudeAccountSwitcher:
                 # Safe only on this legacy path: the active store's env-following
                 # file backend and the default profile coincide here.
                 return self._refuse_degraded_capture()
-        # Only this profile's own ``primaryApiKey`` — never the unsuffixed
-        # "Claude Code" Keychain item, which belongs to the default profile
-        # and would answer for a login that is not the one being added.
-        key = (self._read_json(get_global_config_path()) or {}).get("primaryApiKey")
-        return key if isinstance(key, str) else ""
+        # Only this profile's own managed key: its hashed Keychain item (named
+        # like claude's own, see _active_managed_keychain_services) and its
+        # ``primaryApiKey`` — never the unsuffixed "Claude Code" item, which
+        # belongs to the default profile and would answer for a login that is
+        # not the one being added.
+        return self._store._read_managed_key()
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)

@@ -1,0 +1,50 @@
+"""The CI binary check fails loudly, with the broken expectation named."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+SCRIPT = Path(__file__).parent.parent / ".github" / "scripts" / "check_claude_code_keychain.py"
+
+GOOD = b"""
+`Claude Code${cn().OAUTH_FILE_SUFFIX}${e}${a}` var T="-credentials"
+c("sha256").update(r).digest("hex").substring(0,8)
+CLAUDE_SECURESTORAGE_CONFIG_DIR
+["find-generic-password","-a",yP(),"-w","-s",RB()]
+/^[a-zA-Z0-9._-]+$/ claude-code-user .credentials.json
+(await Vn().readAsync(r))?.designOauth ({...e,designOauth:r})
+"""
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("check_cc_keychain", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_matching_binary_passes(tmp_path):
+    binary = tmp_path / "claude"
+    binary.write_bytes(GOOD)
+    assert _load().check_binary("v1", str(binary)) == []
+
+
+def test_changed_binary_names_the_broken_expectation(tmp_path):
+    binary = tmp_path / "claude"
+    binary.write_bytes(GOOD.replace(b'substring(0,8)', b'substring(0,12)'))
+    failures = _load().check_binary("v2", str(binary))
+    assert len(failures) == 1
+    assert "[v2]" in failures[0] and "config-dir hash" in failures[0]
+    assert "re-verify cswap's Keychain naming" in failures[0]
+
+
+def test_unrelated_binary_fails_every_check(tmp_path):
+    binary = tmp_path / "claude"
+    binary.write_bytes(b"nothing here")
+    module = _load()
+    assert len(module.check_binary("x", str(binary))) == len(module.CHECKS)
+
+
+def test_cswap_side_assertions_hold():
+    _load().check_cswap()

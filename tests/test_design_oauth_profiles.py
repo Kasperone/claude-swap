@@ -106,10 +106,9 @@ class TestEnvVarProfileFile:
 @posix_only
 @pytest.mark.no_keychain_fake
 class TestEnvVarProfileKeychain:
-    """With CLAUDE_CONFIG_DIR set, claude's own item is the hashed service,
-    which cswap reads but never writes (see the ``session`` docstring). The
-    swap's writes land on the unsuffixed item; designOauth must survive in
-    both, and the hashed item must stay byte-identical."""
+    """With CLAUDE_CONFIG_DIR set, the active item is claude's hashed service.
+    Reads, writes and deletes all target it and nothing else: the default
+    profile's unsuffixed item must stay byte-identical."""
 
     @pytest.fixture
     def sw(self, profile, keychain, monkeypatch):  # noqa: F811
@@ -118,53 +117,112 @@ class TestEnvVarProfileKeychain:
         sw.platform = Platform.MACOS
         return sw
 
-    def test_swap_trio_keeps_design_oauth_and_leaves_hashed_item(
+    def test_swap_trio_keeps_design_oauth_in_the_hashed_item(
         self, sw, profile, keychain  # noqa: F811
     ):
         hashed = keychain_service_name(str(profile))
-        live = _login("fake-live", designOauth=DESIGN)
-        keychain.put(hashed, live)
+        keychain.put(hashed, _login("fake-live", designOauth=DESIGN))
 
         _swap(sw, _login("fake-target", designOauth={"accessToken": "stale"}))
-        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        item = keychain.get_json(hashed)
         assert item["designOauth"] == DESIGN
         assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
 
         _swap(sw, API_KEY)
-        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
-            "designOauth": DESIGN
-        }
+        assert keychain.get_json(hashed) == {"designOauth": DESIGN}
+        assert sw._read_credentials() == API_KEY
 
         _swap(sw, _login("fake-target2"))
-        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        item = keychain.get_json(hashed)
         assert item["designOauth"] == DESIGN
         assert item["claudeAiOauth"] == {"accessToken": "fake-target2"}
-        assert keychain.get(hashed) == live
 
-    def test_api_key_swap_preserves_design_oauth_in_unsuffixed_item_only(
-        self, sw, profile, keychain  # noqa: F811
-    ):
-        # The item cswap deletes is the unsuffixed one, so that is the item
-        # whose designOauth is carried — never the hashed item's.
-        hashed = keychain_service_name(str(profile))
-        keychain.put(hashed, _login("fake-live", designOauth={"accessToken": "hashed"}))
+    def test_default_profile_item_is_never_touched(self, sw, profile, keychain):  # noqa: F811
+        default_item = _login("fake-default", designOauth={"accessToken": "default"})
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, default_item)
         keychain.put(
-            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-default", designOauth=DESIGN)
+            keychain_service_name(str(profile)),
+            _login("fake-live", designOauth=DESIGN),
+        )
+
+        _swap(sw, _login("fake-target"))
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == default_item
+        _swap(sw, API_KEY)
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == default_item
+        _swap(sw, _login("fake-target2"))
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == default_item
+
+    def test_other_profiles_hashed_item_is_never_touched(
+        self, sw, profile, keychain, temp_home  # noqa: F811
+    ):
+        other = keychain_service_name(str(temp_home / "profiles" / "other"))
+        other_item = _login("fake-other", designOauth={"accessToken": "other"})
+        keychain.put(other, other_item)
+        keychain.put(keychain_service_name(str(profile)), _login("fake-live"))
+
+        _swap(sw, API_KEY)
+
+        assert keychain.get(other) == other_item
+
+    def test_no_item_is_created_in_the_default_service(self, sw, profile, keychain):  # noqa: F811
+        keychain.put(
+            keychain_service_name(str(profile)),
+            _login("fake-live", designOauth=DESIGN),
         )
 
         _swap(sw, API_KEY)
 
-        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
-            "designOauth": DESIGN
-        }
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
-    def test_api_key_swap_creates_no_stray_item(self, sw, profile, keychain):  # noqa: F811
-        hashed = keychain_service_name(str(profile))
-        keychain.put(hashed, _login("fake-live", designOauth=DESIGN))
+    def test_managed_key_uses_the_profiles_own_item(self, sw, profile, keychain):  # noqa: F811
+        # Claude Code names the managed-key item like the credentials item
+        # minus "-credentials": hashed under CLAUDE_CONFIG_DIR. The default
+        # profile's "Claude Code" key must never be written or deleted.
+        hashed_managed = keychain_service_name(str(profile)).replace("-credentials", "")
+        default_key = "sk-ant-api03-" + "z9y8x7w6v5" * 4
+        keychain.put("Claude Code", default_key)
+        keychain.put(
+            keychain_service_name(str(profile)),
+            _login("fake-live", designOauth=DESIGN),
+        )
 
         _swap(sw, API_KEY)
+        assert keychain.get(hashed_managed) == API_KEY
+        assert keychain.get("Claude Code") == default_key
+        assert sw._read_credentials() == API_KEY
 
-        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+        _swap(sw, _login("fake-target"))
+        assert keychain.get(hashed_managed) is None
+        assert keychain.get("Claude Code") == default_key
+        assert keychain.get_json(keychain_service_name(str(profile)))[
+            "designOauth"
+        ] == DESIGN
+
+    def test_add_account_sees_the_profiles_own_managed_key_only(
+        self, sw, profile, keychain  # noqa: F811
+    ):
+        from claude_swap.exceptions import CredentialReadError, ValidationError
+
+        sw._setup_directories()
+        _write_identity(profile)
+        keychain.put("Claude Code", "sk-ant-api03-" + "z9y8x7w6v5" * 4)  # default's
+
+        with pytest.raises(CredentialReadError):  # not the default profile's key
+            sw.add_account()
+
+        hashed_managed = keychain_service_name(str(profile)).replace("-credentials", "")
+        keychain.put(hashed_managed, API_KEY)
+        with pytest.raises(ValidationError):  # this profile's key: rejected as API key
+            sw.add_account()
+
+    def test_design_only_item_is_not_a_login_for_capture(self, sw, profile, keychain):  # noqa: F811
+        from claude_swap.session import read_config_dir_credentials
+
+        keychain.put(
+            keychain_service_name(str(profile)), json.dumps({"designOauth": DESIGN})
+        )
+
+        assert read_config_dir_credentials(str(profile)) is None
 
     def test_add_account_leaves_hashed_item(self, sw, profile, keychain):  # noqa: F811
         sw._setup_directories()
@@ -177,6 +235,49 @@ class TestEnvVarProfileKeychain:
 
         assert "a@x.com" in json.dumps(sw._get_sequence_data()["accounts"])
         assert keychain.get(hashed) == live
+
+
+@posix_only
+@pytest.mark.no_keychain_fake
+class TestEnvVarNamingTheDefaultProfile:
+    """CLAUDE_CONFIG_DIR=~/.claude: both the hashed and the legacy unsuffixed
+    item are this profile's. The existing one is kept."""
+
+    @pytest.fixture
+    def sw(self, temp_home, keychain, monkeypatch):  # noqa: F811
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(temp_home / ".claude"))
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.MACOS))
+        sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.MACOS
+        return sw
+
+    def test_legacy_unsuffixed_item_is_updated_in_place(
+        self, sw, temp_home, keychain  # noqa: F811
+    ):
+        hashed = keychain_service_name(str(temp_home / ".claude"))
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+
+        _swap(sw, _login("fake-target"))
+        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        assert item["designOauth"] == DESIGN
+        assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
+        assert keychain.get(hashed) is None
+
+        _swap(sw, API_KEY)
+        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
+            "designOauth": DESIGN
+        }
+
+    def test_hashed_item_is_updated_in_place(self, sw, temp_home, keychain):  # noqa: F811
+        hashed = keychain_service_name(str(temp_home / ".claude"))
+        keychain.put(hashed, _login("fake-live", designOauth=DESIGN))
+
+        _swap(sw, API_KEY)
+
+        assert keychain.get_json(hashed) == {"designOauth": DESIGN}
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
 
 
 def _seed_slot(sw: ClaudeAccountSwitcher, creds: str) -> None:

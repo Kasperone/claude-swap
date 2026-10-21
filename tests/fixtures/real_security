@@ -1,4 +1,4 @@
 #!/bin/sh
 # Runs the real macOS ``security`` against the runner's real $HOME: the tests
 # isolate $HOME, which hides ~/Library/Keychains (the keychain search list).
-HOME="$CSWAP_REAL_HOME" exec /usr/bin/security "$@"
+HOME="$CSWAP_REAL_HOME" exec "${CSWAP_SECURITY_BIN:-/usr/bin/security}" "$@"

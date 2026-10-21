@@ -56,19 +56,30 @@ jobs:
           uv run pytest -o faulthandler_timeout=300 -v -n 0
           tests/test_design_oauth_macos_real.py
 
-      - name: Check cswap's Keychain naming against the published Claude Code binary (macOS)
+      - name: Check cswap's Keychain naming against Claude Code (pinned + latest, macOS)
         if: runner.os == 'macOS'
         env:
-          CC_VERSION: 2.1.306  # pinned: the check greps minified code
+          CC_PINNED_VERSION: 2.1.306
         run: |
-          # npm pack only downloads the tarball (no install scripts, no
-          # execution, no login); the binary is read as bytes.
-          WORK="$RUNNER_TEMP/cc-package"
-          mkdir -p "$WORK/extract"
+          # Read-only: `npm pack` only downloads tarballs (no install scripts,
+          # no execution, no login); binaries are inspected as bytes. Runs
+          # against the pinned version AND the latest published one, so a
+          # Claude Code release that changes the credential storage turns this
+          # red with the broken expectation named.
           ARCH="$(uname -m | sed 's/x86_64/x64/')"
-          (cd "$WORK" && npm pack "@anthropic-ai/claude-code-darwin-$ARCH@$CC_VERSION" --silent \
-            && tar -xzf ./*.tgz -C extract)
-          uv run python .github/scripts/check_claude_code_keychain.py "$WORK/extract/package/claude"
+          PKG="@anthropic-ai/claude-code-darwin-$ARCH"
+          LATEST="$(npm view "$PKG" version)"
+          echo "pinned=$CC_PINNED_VERSION latest=$LATEST"
+          ARGS=()
+          for VERSION in "$CC_PINNED_VERSION" "$LATEST"; do
+            DIR="$RUNNER_TEMP/cc-$VERSION"
+            [ -d "$DIR" ] && continue
+            mkdir -p "$DIR/extract"
+            (cd "$DIR" && npm pack "$PKG@$VERSION" --silent >/dev/null \
+              && tar -xzf ./*.tgz -C extract)
+            ARGS+=("$VERSION=$DIR/extract/package/claude")
+          done
+          uv run python .github/scripts/check_claude_code_keychain.py "${ARGS[@]}"
 
       - name: Delete temporary keychain (macOS)
         if: always() && runner.os == 'macOS'

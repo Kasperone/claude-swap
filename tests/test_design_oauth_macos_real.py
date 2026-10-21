@@ -10,6 +10,7 @@ a keychain.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -24,10 +25,18 @@ from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 # ``keychain`` fixture below differs.
 from tests.test_design_oauth_macos import (  # noqa: F401
     ACCOUNT,
+    DESIGN,
     FakeKeychain,
     TestAddRemovePurgeOnKeychain,
     TestSwapOnKeychain,
+    _login,
     switcher,
+)
+from tests.test_design_oauth_profiles import (  # noqa: F401
+    TestEnvVarNamingTheDefaultProfile,
+    TestEnvVarProfileKeychain,
+    TestSessionProfileKeychain,
+    profile,
 )
 
 pytestmark = [
@@ -43,14 +52,16 @@ pytestmark = [
 # Captured at import, before any fixture isolates $HOME.
 REAL_HOME = os.environ.get("HOME", "")
 REAL_SECURITY = Path(__file__).parent / "fixtures" / "real_security"
+FAIL_ADD_SECURITY = Path(__file__).parent / "fixtures" / "real_security_fail_add"
 MANAGED_SERVICE = "Claude Code"
 
 
 class RealKeychain(FakeKeychain):
     def __init__(self):
-        pass
+        self.services: set[str] = set()
 
     def put(self, service: str, value: str) -> None:
+        self.services.add(service)
         macos_keychain.set_password(service, ACCOUNT, value)
 
     def get(self, service: str) -> str | None:
@@ -70,7 +81,10 @@ def keychain(monkeypatch) -> RealKeychain:
     monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
     kc = RealKeychain()
     yield kc
-    for service in (CLAUDE_CODE_KEYCHAIN_SERVICE, MANAGED_SERVICE):
+    # Cleanup of the seeded items. Items cswap created under per-test hashed
+    # names stay until the job deletes the whole throwaway keychain.
+    monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
+    for service in {CLAUDE_CODE_KEYCHAIN_SERVICE, MANAGED_SERVICE} | kc.services:
         macos_keychain.delete_password(service, ACCOUNT)
 
 
@@ -79,3 +93,60 @@ def test_real_security_roundtrip_with_json_and_spaces(keychain):
     value = '{"designOauth": {"accessToken": "fake at"}, "n": 1}'
     keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, value)
     assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == value
+
+
+class TestRealKeychainWriteFailure:
+    """cswap's file fallback against the real keychain.
+
+    Reads and deletes go to the real throwaway keychain; the write is refused
+    either at the CLI boundary (guaranteed) or by a genuinely read-only
+    keychain file (best effort; skipped where macOS still lets the write
+    through).
+    """
+
+    ITEM = _login(
+        "fake-live",
+        designOauth=DESIGN,
+        mcpOAuth={"server": {"refreshToken": "fake-mcp"}},
+    )
+
+    def test_refused_write_moves_design_oauth_into_file(
+        self, switcher, keychain, temp_home, monkeypatch
+    ):
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, self.ITEM)
+        monkeypatch.setattr(macos_keychain, "_SECURITY", str(FAIL_ADD_SECURITY))
+
+        switcher._write_credentials(_login("fake-target"))
+
+        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
+        assert written["designOauth"] == DESIGN
+        assert written["mcpOAuth"] == {"server": {"refreshToken": "fake-mcp"}}
+        # The stale item was really deleted, so it cannot shadow the file.
+        monkeypatch.setattr(macos_keychain, "_SECURITY", str(REAL_SECURITY))
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+
+    def test_read_only_keychain_file_keeps_design_oauth(
+        self, switcher, keychain, temp_home
+    ):
+        path = Path(os.environ["CSWAP_CI_KEYCHAIN"])
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, self.ITEM)
+        path.chmod(0o444)
+        try:
+            try:
+                macos_keychain.set_password("claude-swap-probe", ACCOUNT, "x")
+            except macos_keychain.KEYCHAIN_ERRORS:
+                pass
+            else:
+                macos_keychain.delete_password("claude-swap-probe", ACCOUNT)
+                pytest.skip("a read-only keychain file did not block writes here")
+
+            switcher._write_credentials(_login("fake-target"))
+
+            written = json.loads(
+                (temp_home / ".claude" / ".credentials.json").read_text()
+            )
+            assert written["designOauth"] == DESIGN
+            assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
+        finally:
+            path.chmod(0o600)
