@@ -1,0 +1,61 @@
+# Branch-only CI for fix/preserve-design-oauth: full suite on Linux and macOS,
+# plus the designOauth tests against a REAL macOS Keychain (throwaway keychain,
+# password generated per run, fake credentials only).
+name: designOauth CI
+
+on:
+  push:
+    branches: [fix/preserve-design-oauth]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run the whole suite
+        run: uv run pytest -o faulthandler_timeout=600
+
+      - name: Create temporary keychain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          echo "::add-mask::$KEYCHAIN_PW"
+          KEYCHAIN="$RUNNER_TEMP/cswap-test.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Search list first, then default: macOS hides a default that is not
+          # in the search list.
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          echo "CSWAP_CI_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: designOauth against the real Keychain (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        run: >
+          uv run pytest -o faulthandler_timeout=300 -v -n 0
+          tests/test_design_oauth_macos_real.py
+
+      - name: Delete temporary keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: security delete-keychain "$CSWAP_CI_KEYCHAIN" || true
