@@ -5,7 +5,7 @@ name: designOauth CI
 
 on:
   push:
-    branches: [fix/preserve-design-oauth]
+    branches: [fix/preserve-design-oauth, fix/preserve-design-oauth-latest]
   workflow_dispatch:
 
 permissions:
