@@ -60,13 +60,17 @@ jobs:
           uv run pytest -o faulthandler_timeout=300 -v -n 0
           tests/test_design_oauth_macos_real.py
 
-      - name: designOauth on real Windows file semantics (Windows)
+      - name: designOauth and Credential Manager detection on real Windows (Windows)
         if: runner.os == 'Windows'
         timeout-minutes: 10
-        # Verbose and -rs, so the log shows the real-Windows tests ran, not skipped.
+        # Verbose and -rs, so the log shows the real-Windows tests ran, not
+        # skipped. CSWAP_CI_CREDMAN lets test_windows_credman create and remove
+        # throwaway Credential Manager entries with fake values on this runner.
+        env:
+          CSWAP_CI_CREDMAN: '1'
         run: >
           uv run pytest -o faulthandler_timeout=300 -v -rs -n 0
-          tests/test_design_oauth_windows.py
+          tests/test_design_oauth_windows.py tests/test_windows_credman.py
 
       - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
         shell: bash

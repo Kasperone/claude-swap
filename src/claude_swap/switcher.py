@@ -26,7 +26,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, windows_credman
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -312,6 +312,10 @@ class ClaudeAccountSwitcher:
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
+        # Switch even though Claude Code looks to be in Windows Credential
+        # Manager mode (`--ignore-credman`, or CSWAP_IGNORE_CREDMAN=1 for the
+        # TUI/autoswitch). See _refuse_windows_credman.
+        self.ignore_credman = os.environ.get(windows_credman.IGNORE_ENV) == "1"
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
@@ -6746,6 +6750,37 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _refuse_windows_credman(self) -> None:
+        """Refuse a switch while Claude Code may use Windows Credential Manager.
+
+        cswap switches by writing ``.credentials.json``; Claude Code in
+        Credential Manager mode reads its Credential Manager entry first and
+        deleted that file when it moved there, so the switch would silently
+        not take effect. Detection reads presence/flags only and never
+        touches the Credential Manager entry (see :mod:`windows_credman`).
+        No-op off Windows and with ``ignore_credman``.
+        """
+        if self.platform != Platform.WINDOWS or self.ignore_credman:
+            return
+        from claude_swap.credentials import _active_oauth_keychain_services
+
+        mode = windows_credman.detect(_active_oauth_keychain_services())
+        if mode is None:
+            return
+        lead = (
+            "Claude Code is using Windows Credential Manager"
+            if mode.state == windows_credman.ACTIVE
+            else "Claude Code may be using Windows Credential Manager"
+        )
+        raise SwitchError(
+            f"{lead} for its login ({mode.reason}). cswap switches by writing "
+            f"{get_credentials_path()}, which Claude Code does not read in that "
+            "mode, so the switch would silently not take effect. cswap does not "
+            "support Credential Manager and leaves it untouched. To switch "
+            "anyway (e.g. after turning the mode off), re-run with "
+            f"--ignore-credman or set {windows_credman.IGNORE_ENV}=1."
+        )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6773,6 +6808,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import scan_live_sessions
 
         self._refuse_session_shell()
+        self._refuse_windows_credman()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two
