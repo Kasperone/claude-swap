@@ -61,6 +61,7 @@ def _write_identity(profile: Path) -> None:
 class TestEnvVarProfileFile:
     def test_swap_trio_keeps_design_oauth(self, profile):
         sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.LINUX  # file backend, whatever the host
         cred = profile / ".credentials.json"
         cred.write_text(_login("fake-live", designOauth=DESIGN))
 
@@ -81,6 +82,7 @@ class TestEnvVarProfileFile:
         default.write_text(_login("fake-default", designOauth=DESIGN))
         before = default.read_text()
         sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.LINUX  # file backend, whatever the host
         (profile / ".credentials.json").write_text(_login("fake-live"))
 
         _swap(sw, API_KEY)
@@ -89,6 +91,7 @@ class TestEnvVarProfileFile:
 
     def test_add_account_leaves_profile_file(self, profile):
         sw = ClaudeAccountSwitcher()
+        sw.platform = Platform.LINUX  # file backend, whatever the host
         sw._setup_directories()
         live = _login("fake-live", designOauth=DESIGN)
         (profile / ".credentials.json").write_text(live)
