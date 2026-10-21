@@ -41,6 +41,13 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+@pytest.fixture(autouse=True)
+def linux_host(monkeypatch):
+    """Module-level helpers (capture reads, session profiles) ask the host OS
+    through Platform.detect(); the switcher instances get Platform.LINUX."""
+    monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+
+
 @pytest.fixture
 def no_keychain(monkeypatch):
     """Any Keychain call on the Linux path is a bug."""
@@ -217,12 +224,8 @@ class TestSecureStorageDirOverride:
 
 @pytest.mark.usefixtures("no_keychain")
 class TestSessionProfile:
-    @pytest.fixture
-    def detect_linux(self, monkeypatch):
-        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
-
     @posix_only
-    def test_reseed_keeps_profile_design_and_is_0600(self, temp_home, detect_linux):
+    def test_reseed_keeps_profile_design_and_is_0600(self, temp_home):
         sw = _linux()
         _seed_slot(sw, _login("fake-backup", designOauth={"accessToken": "stale"}))
         session_dir = sw.backup_dir / "sessions" / "1-a-x-com"
@@ -237,7 +240,7 @@ class TestSessionProfile:
         assert seeded["designOauth"] == DESIGN
         assert _mode(cred) == 0o600
 
-    def test_reseed_does_not_touch_the_default_file(self, temp_home, detect_linux):
+    def test_reseed_does_not_touch_the_default_file(self, temp_home):
         default = temp_home / ".claude" / ".credentials.json"
         default.write_text(_login("fake-default", designOauth={"accessToken": "d"}))
         before = default.read_text()
