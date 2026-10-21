@@ -8,7 +8,9 @@ asserts the credential-storage logic cswap mirrors is still there:
   hash is "-" + first 8 hex of sha256(NFC config dir) unless default profile
 * account  = $USER, or "claude-code-user" for a name outside [a-zA-Z0-9._-]
 * designOauth is read from / spread into the same credential blob
-  (plaintext fallback: .credentials.json)
+  (plaintext fallback: .credentials.json), and it belongs to the login:
+  logout revokes it and a re-login deletes it (with cloudSessionsOauth)
+  together with claudeAiOauth — why cswap keeps it per account
 * the plaintext file lives in the secure-storage dir (CLAUDE_SECURESTORAGE_CONFIG_DIR
   when defined, empty = ~/.claude), and the only storage kinds are keychain,
   plaintext and windows-credman — Linux has no secret-store backend
@@ -46,6 +48,11 @@ CHECKS = {
     "storage kinds (no Linux secret store)": rb'"keychain","plaintext","windows-credman"',
     "designOauth read": rb"\?\.designOauth",
     "designOauth write (blob spread)": rb"\.\.\.\w+,designOauth:\w+",
+    "re-login deletes designOauth and cloudSessionsOauth with the login":
+        rb"delete \w+\.claudeAiOauth,[^;]{0,200}?delete \w+\.designOauth,"
+        rb"delete \w+\.cloudSessionsOauth",
+    "logout revokes designOauth":
+        rb"\?\.designOauth;if\(\w+\?\.refreshToken\)await \w+\(\w+\.refreshToken,\w+\.clientId\)",
 }
 
 # win32 builds only (``claude.exe``): the plaintext file stays the store unless
@@ -88,14 +95,22 @@ def check_binary(label: str, path: str) -> list[str]:
 def check_cswap() -> None:
     from claude_swap import macos_keychain
     from claude_swap.credentials import (
+        ACCOUNT_CREDENTIAL_KEYS,
         CLAUDE_CODE_KEYCHAIN_SERVICE,
+        SHARED_CREDENTIAL_KEYS,
         _active_managed_keychain_services,
     )
+    from claude_swap.session import STORAGE_OVERRIDE_ENV_VARS
     from claude_swap.session import keychain_service_name
 
     from claude_swap.paths import get_credentials_path
 
     assert CLAUDE_CODE_KEYCHAIN_SERVICE == "Claude Code-credentials"
+    # Account-owned, as the re-login prune above shows.
+    assert {"designOauth", "cloudSessionsOauth"} <= ACCOUNT_CREDENTIAL_KEYS
+    assert not {"designOauth", "cloudSessionsOauth"} & SHARED_CREDENTIAL_KEYS
+    # Sessions drop the store override the "secure-storage dir rule" names.
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in STORAGE_OVERRIDE_ENV_VARS
     with mock.patch.dict(os.environ):
         os.environ["CLAUDE_CONFIG_DIR"] = "/cfg"
         os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "/secure"

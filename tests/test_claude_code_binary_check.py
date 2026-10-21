@@ -17,6 +17,8 @@ CLAUDE_SECURESTORAGE_CONFIG_DIR
 {storageDir:e,storagePath:Q(e,".credentials.json")}
 let e=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;if(e!==void 0)return(e||u(o(),".claude"))
 new Set(["keychain","plaintext","windows-credman"])
+delete e.claudeAiOauth,delete e.organizationUuid,delete e.designOauth,delete e.cloudSessionsOauth,e}
+let m=e?.designOauth;if(m?.refreshToken)await X_(m.refreshToken,m.clientId)
 """
 
 
@@ -40,6 +42,13 @@ def test_changed_binary_names_the_broken_expectation(tmp_path):
     assert len(failures) == 1
     assert "[v2]" in failures[0] and "config-dir hash" in failures[0]
     assert "re-verify cswap's Keychain naming" in failures[0]
+
+
+def test_designoauth_ownership_change_is_flagged(tmp_path):
+    binary = tmp_path / "claude"
+    binary.write_bytes(GOOD.replace(b"delete e.designOauth,", b""))
+    failures = _load().check_binary("v3", str(binary))
+    assert len(failures) == 1 and "re-login deletes designOauth" in failures[0]
 
 
 def test_unrelated_binary_fails_every_check(tmp_path):
