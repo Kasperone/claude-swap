@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import with_design_oauth
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -267,6 +268,16 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         )
     except macos_keychain.KEYCHAIN_ERRORS:
         pass  # best-effort; absent entry is already success (rc 44)
+
+
+def _design_oauth_of(credentials: str | None) -> dict | None:
+    """The ``designOauth`` object of a credential JSON blob, else ``None``."""
+    try:
+        data = json.loads(credentials) if credentials else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+    design = data.get("designOauth") if isinstance(data, dict) else None
+    return design if isinstance(design, dict) else None
 
 
 def read_session_credentials(session_dir: Path) -> str | None:
@@ -883,6 +894,11 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
+        # The profile's own Claude Design login (designOauth) lives in the
+        # profile's store, not the backup: read it before the delete below
+        # removes the hashed item, and carry it into the seed.
+        profile_design = _design_oauth_of(read_session_credentials(session_dir))
+
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
@@ -903,6 +919,9 @@ class SessionManager:
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+
+        if profile_design is not None:
+            creds = with_design_oauth(creds, profile_design)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is

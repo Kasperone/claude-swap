@@ -56,6 +56,20 @@ jobs:
           uv run pytest -o faulthandler_timeout=300 -v -n 0
           tests/test_design_oauth_macos_real.py
 
+      - name: Check cswap's Keychain naming against the published Claude Code binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CC_VERSION: 2.1.306  # pinned: the check greps minified code
+        run: |
+          # npm pack only downloads the tarball (no install scripts, no
+          # execution, no login); the binary is read as bytes.
+          WORK="$RUNNER_TEMP/cc-package"
+          mkdir -p "$WORK/extract"
+          ARCH="$(uname -m | sed 's/x86_64/x64/')"
+          (cd "$WORK" && npm pack "@anthropic-ai/claude-code-darwin-$ARCH@$CC_VERSION" --silent \
+            && tar -xzf ./*.tgz -C extract)
+          uv run python .github/scripts/check_claude_code_keychain.py "$WORK/extract/package/claude"
+
       - name: Delete temporary keychain (macOS)
         if: always() && runner.os == 'macOS'
         run: security delete-keychain "$CSWAP_CI_KEYCHAIN" || true

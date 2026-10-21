@@ -1014,10 +1014,16 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to keep designOauth in Keychain: {e}")
 
     def _design_oauth_in_keychain(self) -> dict:
-        """``designOauth`` held by the active OAuth Keychain item (macOS), if any."""
+        """``designOauth`` held by the active OAuth Keychain item (macOS), if any.
+
+        Reads ``CLAUDE_CODE_KEYCHAIN_SERVICE`` itself, not the active profile's
+        hashed item: this is the item :meth:`_delete_active_keychain_entry`
+        removes and :meth:`_write_oauth_credentials` writes, so it is exactly
+        what has to be carried across.
+        """
         if not self._use_keychain():
             return {}
-        value, _failed = self._read_active_oauth_keychain()
+        value, _failed = self._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
         data = _credential_object(value)
         if data and "designOauth" in data:
             return {"designOauth": data["designOauth"]}
@@ -1096,6 +1102,7 @@ class CredentialStore:
         # that just failed. Write the plaintext file and (macOS) best-effort clear
         # any stale Keychain entry so Claude Code's keychain-first read can't shadow
         # it (#30337).
+        credentials = self._with_keychain_shared_fields(credentials)
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1109,6 +1116,36 @@ class CredentialStore:
             # authority, so hand it over rather than re-deriving it from flags.
             self._pin_file_mode(residual_cleared=cleared)
         self._last_active_credentials_backend = "file"
+
+    def _with_keychain_shared_fields(self, credentials: str) -> str:
+        """Carry the Keychain item's machine-shared fields into a file-mode write.
+
+        The file fallback is followed by deleting the active Keychain item (it
+        would otherwise shadow the file). That item may hold ``designOauth`` and
+        the other ``SHARED_CREDENTIAL_KEYS`` the incoming credential lacks —
+        e.g. when the Keychain was unreadable while the switch composed it — so
+        read them first and add only the ones that are absent. Best-effort: an
+        unreadable item leaves ``credentials`` as given.
+        """
+        if self._host.platform != Platform.MACOS:
+            return credentials
+        target = _credential_object(credentials)
+        if target is None or "claudeAiOauth" not in target:
+            return credentials
+        try:
+            item = macos_keychain.get_password(
+                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+            )
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return credentials
+        carried = {
+            key: value
+            for key, value in (shared_credential_fields(item) or {}).items()
+            if key not in target
+        }
+        if not carried:
+            return credentials
+        return json.dumps({**target, **carried})
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
         """Bump an already-present ``.credentials.json``'s mtime after a Keychain write.

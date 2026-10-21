@@ -36,6 +36,9 @@ def run(argv):
             return 44
         del db[key]
     elif cmd == "add-generic-password":
+        if os.environ.get("FAKE_SECURITY_FAIL_ADD"):
+            print("fake security: write refused", file=sys.stderr)
+            return 45
         db[key] = bytes.fromhex(opts["-X"]).decode()
     else:
         return 1

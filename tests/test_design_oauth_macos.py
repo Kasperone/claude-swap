@@ -194,3 +194,99 @@ class TestAddRemovePurgeOnKeychain:
             switcher.purge()
 
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == live
+
+
+class TestKeychainWriteFailure:
+    """The Keychain write fails, so cswap falls back to the file and deletes
+    the Keychain item (it would shadow the file). designOauth and the other
+    shared fields the item holds must travel into the file first."""
+
+    @pytest.fixture
+    def failing(self, switcher, keychain, monkeypatch):
+        monkeypatch.setenv("FAKE_SECURITY_FAIL_ADD", "1")
+        return switcher
+
+    def test_design_oauth_moves_into_file(self, failing, keychain, temp_home):
+        item = _login(
+            "fake-live",
+            designOauth=DESIGN,
+            mcpOAuth={"server": {"refreshToken": "fake-mcp"}},
+        )
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, item)
+
+        failing._write_credentials(_login("fake-target"))
+
+        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
+        assert written["designOauth"] == DESIGN
+        assert written["mcpOAuth"] == {"server": {"refreshToken": "fake-mcp"}}
+        # The stale item is gone so it cannot shadow the file.
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+
+    def test_credentials_own_fields_win_over_the_item(
+        self, failing, keychain, temp_home
+    ):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE,
+            _login("fake-live", designOauth={"accessToken": "older"}),
+        )
+        incoming = _login("fake-target", designOauth=DESIGN)
+
+        failing._write_credentials(incoming)
+
+        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert written["designOauth"] == DESIGN
+
+    def test_full_swap_keeps_design_oauth_when_live_was_unreadable(
+        self, failing, keychain, temp_home
+    ):
+        # No live read reached _prepare (nothing composed in): the item alone
+        # carries designOauth.
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+
+        failing._write_credentials(
+            failing._prepare_credentials_for_activation(_login("fake-target"), None)
+        )
+
+        written = json.loads((temp_home / ".claude" / ".credentials.json").read_text())
+        assert written["designOauth"] == DESIGN
+        assert failing._read_credentials() == json.dumps(written)
+
+    def test_item_without_shared_fields_leaves_credentials_verbatim(
+        self, failing, keychain, temp_home
+    ):
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live"))
+        target = _login("fake-target")
+
+        failing._write_credentials(target)
+
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == target
+
+    def test_failed_write_with_unwritable_file_keeps_the_item(
+        self, failing, keychain, temp_home, monkeypatch
+    ):
+        # Both stores refuse: the existing item must not be deleted.
+        from claude_swap.exceptions import CredentialWriteError
+
+        item = _login("fake-live", designOauth=DESIGN)
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, item)
+
+        def boom(self, creds):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            type(failing._store), "_write_active_credentials_file", boom
+        )
+        with pytest.raises(CredentialWriteError):
+            failing._write_credentials(_login("fake-target"))
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == item
+
+
+def test_account_name_falls_back_like_claude_code(monkeypatch):
+    monkeypatch.setenv("USER", "dom\\user name")
+    assert macos_keychain.keychain_account_name() == "claude-code-user"
+    monkeypatch.setenv("USER", "ok.user-1_x")
+    assert macos_keychain.keychain_account_name() == "ok.user-1_x"
