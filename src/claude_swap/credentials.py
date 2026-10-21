@@ -217,6 +217,9 @@ SHARED_CREDENTIAL_KEYS = frozenset({
     "mcpXaaIdp",
     "mcpXaaIdpConfig",
     "pluginSecrets",
+    # Claude Design login: tied to the machine's Claude Code install, not to
+    # a swapped account slot, so a switch must never drop or replace it.
+    "designOauth",
 })
 
 # Account-scoped siblings cswap knows about, named so the unrecognized-key
@@ -962,9 +965,29 @@ class CredentialStore:
         cred_file = get_credentials_path()
         try:
             if cred_file.exists():
-                cred_file.unlink()
+                kept = self._machine_shared_remainder(cred_file)
+                if kept:
+                    # Drop the login but keep machine-shared keys (designOauth).
+                    self._write_active_credentials_file(json.dumps(kept))
+                else:
+                    cred_file.unlink()
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
+
+    @staticmethod
+    def _machine_shared_remainder(cred_file: Path) -> dict:
+        """Machine-shared fields (``designOauth``) of an on-disk credentials file.
+
+        Empty when the file is unreadable, not a JSON object, or holds none —
+        the caller then removes the file as before.
+        """
+        try:
+            data = json.loads(cred_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: data[k] for k in ("designOauth",) if k in data}
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
