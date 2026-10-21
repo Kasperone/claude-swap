@@ -1,0 +1,196 @@
+"""``designOauth`` on the macOS Keychain path, against a FAKE ``security`` CLI.
+
+``macos_keychain`` is pointed at an executable script that stores items in a JSON
+file under tmp_path, so the real subprocess/argv/``-i`` stdin code runs without
+touching any Keychain. Fake credentials only.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from claude_swap import macos_keychain
+from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
+from claude_swap.models import Platform
+from claude_swap.switcher import ClaudeAccountSwitcher
+
+pytestmark = [
+    pytest.mark.no_keychain_fake,
+    pytest.mark.skipif(sys.platform == "win32", reason="fake security is a POSIX script"),
+]
+
+API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+DESIGN = {"accessToken": "fake-design-at", "refreshToken": "fake-design-rt"}
+ACCOUNT = "fakeuser"
+
+FAKE_SECURITY = Path(__file__).parent / "fixtures" / "fake_security"
+
+
+class FakeKeychain:
+    def __init__(self, db: Path):
+        self.db = db
+
+    def _data(self) -> dict:
+        return json.loads(self.db.read_text()) if self.db.exists() else {}
+
+    def put(self, service: str, value: str) -> None:
+        data = self._data()
+        data[f"{service}\0{ACCOUNT}"] = value
+        self.db.write_text(json.dumps(data))
+
+    def get(self, service: str) -> str | None:
+        return self._data().get(f"{service}\0{ACCOUNT}")
+
+    def get_json(self, service: str) -> dict:
+        return json.loads(self.get(service))
+
+
+@pytest.fixture
+def keychain(tmp_path: Path, monkeypatch) -> FakeKeychain:
+    script = FAKE_SECURITY
+    db = tmp_path / "fake-keychain.json"
+    monkeypatch.setenv("FAKE_SECURITY_DB", str(db))
+    monkeypatch.setenv("USER", ACCOUNT)
+    monkeypatch.setattr(macos_keychain, "_SECURITY", str(script))
+    return FakeKeychain(db)
+
+
+@pytest.fixture
+def switcher(temp_home, keychain) -> ClaudeAccountSwitcher:
+    sw = ClaudeAccountSwitcher()
+    sw.platform = Platform.MACOS
+    return sw
+
+
+def _login(token: str, **extra) -> str:
+    return json.dumps({"claudeAiOauth": {"accessToken": token}, **extra})
+
+
+def _swap(sw: ClaudeAccountSwitcher, target: str) -> None:
+    """The activation sequence ``_perform_switch`` runs."""
+    live = sw._read_credentials()
+    sw._write_credentials(sw._prepare_credentials_for_activation(target, live))
+
+
+def test_fake_security_roundtrip(keychain):
+    macos_keychain.set_password("svc", ACCOUNT, '{"a": "b c"}')
+    assert macos_keychain.get_password("svc", ACCOUNT) == '{"a": "b c"}'
+    macos_keychain.delete_password("svc", ACCOUNT)
+    assert macos_keychain.get_password("svc", ACCOUNT) is None
+
+
+class TestSwapOnKeychain:
+    def test_oauth_to_oauth_live_design_oauth_wins(self, switcher, keychain):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        _swap(switcher, _login("fake-target", designOauth={"accessToken": "stale"}))
+
+        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        assert item["designOauth"] == DESIGN
+        assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
+
+    def test_oauth_to_api_key_keeps_only_design_oauth(self, switcher, keychain):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        _swap(switcher, API_KEY)
+
+        assert keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE) == {
+            "designOauth": DESIGN
+        }
+        # The design-only residue must not mask the activated key.
+        assert switcher._read_credentials() == API_KEY
+
+    def test_oauth_to_api_key_without_design_oauth_removes_item(
+        self, switcher, keychain
+    ):
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live"))
+        _swap(switcher, API_KEY)
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None
+
+    def test_api_key_to_oauth_restores_design_oauth(self, switcher, keychain):
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        _swap(switcher, API_KEY)
+        _swap(switcher, _login("fake-target"))
+
+        item = keychain.get_json(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        assert item["designOauth"] == DESIGN
+        assert item["claudeAiOauth"] == {"accessToken": "fake-target"}
+
+    def test_api_key_to_oauth_without_residue_is_verbatim(self, switcher, keychain):
+        _swap(switcher, API_KEY)
+        target = _login("fake-target")
+        _swap(switcher, target)
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == target
+
+    def test_stale_credentials_file_is_refreshed_with_design_oauth(
+        self, switcher, keychain, temp_home
+    ):
+        cred_file = temp_home / ".claude" / ".credentials.json"
+        cred_file.write_text(_login("fake-old"))
+        keychain.put(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, _login("fake-live", designOauth=DESIGN)
+        )
+        _swap(switcher, _login("fake-target"))
+
+        assert json.loads(cred_file.read_text())["designOauth"] == DESIGN
+
+
+class TestAddRemovePurgeOnKeychain:
+    def _seed(self, sw, keychain):
+        sw._setup_directories()
+        sw._init_sequence_file()
+        data = sw._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "u1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        sw._write_json(sw.sequence_file, data)
+        live = _login("fake-live", designOauth=DESIGN)
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, live)
+        return live
+
+    def test_add_account_leaves_live_item(self, switcher, keychain, temp_home):
+        switcher._setup_directories()
+        live = _login("fake-live", designOauth=DESIGN)
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, live)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@x.com",
+                "accountUuid": "u1",
+                "organizationUuid": "",
+                "organizationName": "",
+            }
+        }))
+        switcher.add_account()
+
+        assert "a@x.com" in json.dumps(switcher._get_sequence_data()["accounts"])
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == live
+
+    def test_remove_account_leaves_live_item(self, switcher, keychain, monkeypatch):
+        live = self._seed(switcher, keychain)
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        switcher.remove_account("1")
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == live
+
+    def test_purge_leaves_live_item(self, switcher, keychain):
+        live = self._seed(switcher, keychain)
+        with patch("builtins.input", return_value="y"):
+            switcher.purge()
+
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == live

@@ -51,6 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
+    with_design_oauth,
 )
 from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
@@ -769,7 +770,12 @@ class ClaudeAccountSwitcher:
         """
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:
-            return target_credentials
+            # A managed API key (or nothing) is live. The target stays verbatim
+            # except for the Design login an earlier API-key switch kept aside.
+            design = self._store.residual_design_oauth()
+            if design is None:
+                return target_credentials
+            return with_design_oauth(target_credentials, design)
         return merge_shared_credential_fields(target_credentials, live_shared)
 
     def _uses_file_backup_backend(self) -> bool:

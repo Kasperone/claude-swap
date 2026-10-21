@@ -285,6 +285,29 @@ def merge_shared_credential_fields(
     return json.dumps(composed)
 
 
+def is_design_only(credentials: str | None) -> bool:
+    """Whether a stored blob holds only ``designOauth`` and no login.
+
+    That is the residue left when a managed API key is activated: the OAuth
+    login is gone but ``designOauth`` is kept. It is not a credential, so the
+    active-credential reader must see past it to the managed key.
+    """
+    data = _credential_object(credentials)
+    return bool(data) and set(data) == {"designOauth"}
+
+
+def with_design_oauth(target_credentials: str, design: dict) -> str:
+    """Add the machine's ``designOauth`` to a target Claude login.
+
+    Used when the live credential is a managed API key, where the rest of the
+    target stays verbatim. Unchanged when the target is not a Claude login.
+    """
+    target = _credential_object(target_credentials)
+    if target is None or "claudeAiOauth" not in target:
+        return target_credentials
+    return json.dumps({**target, "designOauth": design})
+
+
 def approved_form(api_key: str) -> str:
     """The value Claude Code stores in ``customApiKeyResponses.approved``.
 
@@ -627,7 +650,7 @@ class CredentialStore:
             # item cannot erase it. Sticky until this read succeeds again,
             # which is what makes it self-heal without being erasable.
             self._active_read_failed = keychain_failed
-            if val:
+            if val and not is_design_only(val):
                 return ActiveCredentials(val, False)
         elif self._residual_verdict is False or (
             self._active_read_failed or self._keychain_unreadable
@@ -655,7 +678,7 @@ class CredentialStore:
                 # there is; hardcoding False made it render as "no credentials"
                 # and sent the user to a re-login that cannot help.
                 return ActiveCredentials(None, keychain_failed, keychain_failed)
-            if text.strip():
+            if text.strip() and not is_design_only(text):
                 return ActiveCredentials(text, False, keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
@@ -960,19 +983,59 @@ class CredentialStore:
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        The machine-shared ``designOauth`` is not part of that login: it is read
+        before the delete and written back alone, to each store it was found in.
         """
+        design_kc = self._design_oauth_in_keychain()
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
+        design_file: dict = {}
         try:
             if cred_file.exists():
-                kept = self._machine_shared_remainder(cred_file)
-                if kept:
-                    # Drop the login but keep machine-shared keys (designOauth).
-                    self._write_active_credentials_file(json.dumps(kept))
-                else:
-                    cred_file.unlink()
+                design_file = self._machine_shared_remainder(cred_file)
+                cred_file.unlink()
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
+        if design_file:
+            try:
+                self._write_active_credentials_file(json.dumps(design_file))
+            except Exception as e:
+                self._host._logger.warning(f"Failed to keep designOauth in file: {e}")
+        if design_kc:
+            try:
+                self._kc_call(
+                    macos_keychain.set_password,
+                    CLAUDE_CODE_KEYCHAIN_SERVICE,
+                    macos_keychain.keychain_account_name(),
+                    json.dumps(design_kc),
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                self._host._logger.warning(f"Failed to keep designOauth in Keychain: {e}")
+
+    def _design_oauth_in_keychain(self) -> dict:
+        """``designOauth`` held by the active OAuth Keychain item (macOS), if any."""
+        if not self._use_keychain():
+            return {}
+        value, _failed = self._read_active_oauth_keychain()
+        data = _credential_object(value)
+        if data and "designOauth" in data:
+            return {"designOauth": data["designOauth"]}
+        return {}
+
+    def residual_design_oauth(self) -> dict | None:
+        """``designOauth`` left behind by an API-key activation, else ``None``.
+
+        Looked up in the Keychain item and the plaintext file. Lets the next
+        API-key -> OAuth switch carry it over even though the live credential
+        is then a raw API key, which has no JSON object to take it from.
+        """
+        found = self._design_oauth_in_keychain()
+        if not found:
+            cred_file = get_credentials_path()
+            if cred_file.exists():
+                found = self._machine_shared_remainder(cred_file)
+        return found.get("designOauth") if found else None
 
     @staticmethod
     def _machine_shared_remainder(cred_file: Path) -> dict:

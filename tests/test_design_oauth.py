@@ -160,3 +160,31 @@ class TestAddRemovePurge:
             switcher.purge()
 
         assert _cred_file(temp_home).read_text() == live
+
+
+class TestApiKeyResidue:
+    """After an API-key swap the design-only file must not mask the key, and
+    the next OAuth swap must carry designOauth back."""
+
+    def test_active_read_sees_through_design_only_file(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        _live(temp_home, designOauth=DESIGN)
+        switcher._write_credentials(API_KEY)
+
+        assert switcher._read_credentials() == API_KEY
+
+    def test_api_key_to_oauth_restores_design_oauth(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        _live(temp_home, designOauth=DESIGN)
+        switcher._write_credentials(API_KEY)
+
+        target = json.dumps({"claudeAiOauth": {"accessToken": "fake-target"}})
+        switcher._write_credentials(
+            switcher._prepare_credentials_for_activation(
+                target, switcher._read_credentials()
+            )
+        )
+
+        written = json.loads(_cred_file(temp_home).read_text())
+        assert written["designOauth"] == DESIGN
+        assert written["claudeAiOauth"] == {"accessToken": "fake-target"}
