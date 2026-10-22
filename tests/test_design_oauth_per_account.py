@@ -431,7 +431,7 @@ class MigrationScenarios:
         assert self.profile_blob(p4)["designOauth"] == D4
         assert _design(_backup(sw, "4")) == D4
 
-    def test_live_profile_is_marked_then_stripped_once_quiescent(
+    def test_live_profile_is_stripped_under_its_locks_and_marked(
         self, sw, temp_home, monkeypatch
     ):
         self._shared_era(sw, temp_home)
@@ -444,15 +444,48 @@ class MigrationScenarios:
         migrations.run_migrations(sw)
         assert migrations.DESIGN_MIGRATION_ID in _applied(sw)
         assert _design(_backup(sw, "2")) is None
-        # Not rewritten under the running claude, but ignored from now on.
+        # Removed under the running claude's own locks (it can no longer
+        # refresh the owner's copy), login kept; ignored from now on as well.
+        blob = self.profile_blob(p2)
+        assert "designOauth" not in blob
+        assert blob["claudeAiOauth"] == json.loads(_login("2"))["claudeAiOauth"]
+        assert session_mod._profile_design_oauth(p2) is None
+        assert session_mod.foreign_design_fingerprints(p2) == {design_fingerprint(D1)}
+        assert not list(p2.glob("*.lock"))  # its locks are released
+
+        # The session exits: the next adoption settles the marker.
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: True)
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert "designOauth" not in self.profile_blob(p2)
+        assert not session_mod.foreign_design_marker_for(p2).exists()
+        assert _design(_backup(sw, "2")) is None
+
+    def test_live_profile_with_busy_locks_is_marked_then_stripped_once_quiescent(
+        self, sw, temp_home, monkeypatch
+    ):
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+        monkeypatch.setattr(session_mod, "_LIVE_STRIP_LOCK_TIMEOUT", 0.1)
+        busy = p2 / ".design_oauth_refresh.lock"  # its claude is mid-refresh
+        busy.mkdir()
+
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+        # Not rewritten while its claude holds the lock, but ignored.
         assert self.profile_blob(p2)["designOauth"] == D1_OLD
         assert session_mod._profile_design_oauth(p2) is None
         assert session_mod.foreign_design_fingerprints(p2) == {design_fingerprint(D1)}
 
-        # The session exits: the next adoption strips it, marker gone.
+        # Still running, lock free again: the next adoption pass strips it.
+        busy.rmdir()
+        assert sw._adopt_session_credential("2", _email("2"), "") is None
+        assert "designOauth" not in self.profile_blob(p2)
+        assert session_mod.foreign_design_marker_for(p2).exists()
+
+        # The session exits: the marker goes.
         monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: True)
         sw._adopt_session_credential("2", _email("2"), "")
-        assert "designOauth" not in self.profile_blob(p2)
         assert not session_mod.foreign_design_marker_for(p2).exists()
         assert _design(_backup(sw, "2")) is None
 
@@ -1064,3 +1097,60 @@ class TestSessionFreshnessMacOS(SessionFreshnessScenarios):
 
     def profile_write(self, session_dir, creds):
         self.keychain.put(keychain_service_name(session_dir), creds)
+
+    def _unreadable_item(self, session_dir, monkeypatch):
+        """Reading the profile's item fails (a denied or timed-out Keychain
+        prompt), while deleting it would still succeed. Returns the real
+        reader, to make it readable again."""
+        service = keychain_service_name(session_dir)
+        real = macos_keychain.get_password
+
+        def get_password(svc, account):
+            if svc == service:
+                raise macos_keychain.KeychainError("fake: read refused")
+            return real(svc, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", get_password)
+        return real
+
+    def _item_design(self, session_dir) -> dict | None:
+        value = self.keychain.get(keychain_service_name(session_dir))
+        return json.loads(value).get("designOauth") if value else None
+
+    def test_unreadable_item_survives_an_invalidation(self, sw, temp_home, monkeypatch):
+        session_dir = self._setup(sw, temp_home)
+        real = self._unreadable_item(session_dir, monkeypatch)
+
+        # The backup is rewritten (e.g. a capture): the quiescent profile
+        # would be invalidated, deleting its item.
+        sw._write_account_credentials("2", _email("2"), _login("2", D2))
+
+        assert self._item_design(session_dir) == D2_NEWER
+        assert session_mod.is_session_stale(session_dir)
+        assert _design(_backup(sw, "2")) == D2
+
+        # Readable again: the next invalidation keeps it in the backup.
+        monkeypatch.setattr(macos_keychain, "get_password", real)
+        assert sw._invalidate_session_credentials("2", _email("2")) is True
+        assert _design(_backup(sw, "2")) == D2_NEWER
+
+    def test_unreadable_item_survives_a_reseed(self, sw, temp_home, monkeypatch):
+        session_dir = self._setup(sw, temp_home, backup_design=D2_OLDER)
+        self._unreadable_item(session_dir, monkeypatch)
+
+        _bootstrap(sw, "2")
+
+        assert self._item_design(session_dir) == D2_NEWER
+        assert session_mod.is_session_stale(session_dir)
+
+    def test_unreadable_item_survives_a_failed_validation_cleanup(
+        self, sw, temp_home, monkeypatch
+    ):
+        session_dir = self._setup(sw, temp_home, backup_design=None)
+        self._unreadable_item(session_dir, monkeypatch)
+
+        SessionManager(sw)._cleanup_failed_session(session_dir, "2", _email("2"), "")
+
+        assert session_dir.exists()
+        assert self._item_design(session_dir) == D2_NEWER
+        assert session_mod.is_session_stale(session_dir)

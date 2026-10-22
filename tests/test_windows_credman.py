@@ -45,14 +45,15 @@ def _on(monkeypatch, platform: str) -> None:
     monkeypatch.setattr(windows_credman, "sys", types.SimpleNamespace(platform=platform))
 
 
-def _targets(monkeypatch, *names: str) -> list[str]:
-    """Stub the enumeration with ``names`` and pretend to be on Windows."""
+def _targets(monkeypatch, *names: str, stamp: int = 1) -> list[str]:
+    """Stub the enumeration with ``names`` (all last written at ``stamp``)
+    and pretend to be on Windows."""
     seen: list[str] = []
 
-    def fake(pattern: str) -> list[str]:
+    def fake(pattern: str) -> dict[str, int]:
         seen.append(pattern)
         prefix = pattern.rstrip("*")
-        return [n for n in names if n.startswith(prefix)]
+        return {n: stamp for n in names if n.startswith(prefix)}
 
     monkeypatch.setattr(windows_credman, "_enumerate_targets", fake)
     _on(monkeypatch, "win32")
@@ -141,6 +142,35 @@ class TestDetect:
         _on(monkeypatch, "win32")
         assert windows_credman.entry_present([CLAUDE_CODE_KEYCHAIN_SERVICE]) is None
         assert windows_credman.detect([CLAUDE_CODE_KEYCHAIN_SERVICE]) is None
+
+    def test_entry_ambiguity_carries_each_entrys_last_written(self, temp_home, monkeypatch):
+        _targets(monkeypatch, f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user",
+                 f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user#m", stamp=7)
+        mode = windows_credman.detect([CLAUDE_CODE_KEYCHAIN_SERVICE])
+        assert mode.entries == (
+            (f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user", 7),
+            (f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user#m", 7),
+        )
+        _flag(temp_home / ".claude.json", True)  # an opt-in carries none
+        assert windows_credman.detect([CLAUDE_CODE_KEYCHAIN_SERVICE]).entries == ()
+
+    def test_briefly_unreadable_config_is_retried(self, temp_home, monkeypatch):
+        """Claude Code rewriting its config can deny a read for a moment on
+        Windows; that alone must not read as "maybe Credential Manager"."""
+        _flag(temp_home / ".claude.json", False)
+        monkeypatch.setattr(windows_credman, "_CONFIG_READ_RETRY_DELAY", 0)
+        real = Path.read_text
+        denied = []
+
+        def read_text(self, *a, **kw):
+            if self.name == ".claude.json" and not denied:
+                denied.append(1)
+                raise PermissionError("sharing violation")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        assert windows_credman.detect([]) is None
+        assert denied == [1]
 
     def test_not_windows_never_enumerates(self, monkeypatch):
         _on(monkeypatch, "linux")
@@ -244,6 +274,95 @@ class TestSwitchOnWindows:
         assert json.loads(windows.read_text())["designOauth"] == DESIGN_2
 
 
+class TestStaleEntryAcknowledgment:
+    """An entry with no opt-in in sight refuses once; overriding it records
+    it as stale, and it refuses again only once Claude Code writes it."""
+
+    ENTRY = f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user"
+
+    def test_override_accepts_the_same_entry_until_claude_code_writes_it(
+        self, windows, monkeypatch
+    ):
+        _targets(monkeypatch, self.ENTRY, stamp=100)
+        with pytest.raises(SwitchError, match="switch once with --ignore-credman"):
+            _switcher(Platform.WINDOWS).switch_to("2", json_output=True)
+
+        forced = _switcher(Platform.WINDOWS)
+        forced.ignore_credman = True
+        forced.switch_to("2", json_output=True)
+        assert json.loads(windows.read_text())["designOauth"] == DESIGN_2
+
+        # The same leftover, untouched: no override needed any more.
+        _switcher(Platform.WINDOWS).switch_to("1", json_output=True)
+        assert json.loads(windows.read_text())["designOauth"] == DESIGN
+
+        # Claude Code wrote the entry: it is in use after all.
+        _targets(monkeypatch, self.ENTRY, stamp=200)
+        with pytest.raises(SwitchError, match="may be using Windows Credential Manager"):
+            _switcher(Platform.WINDOWS).switch_to("2", json_output=True)
+        assert json.loads(windows.read_text())["designOauth"] == DESIGN
+
+    def test_a_new_entry_is_not_covered(self, windows, monkeypatch):
+        _targets(monkeypatch, self.ENTRY, stamp=100)
+        forced = _switcher(Platform.WINDOWS)
+        forced.ignore_credman = True
+        forced.switch_to("2", json_output=True)
+
+        _targets(monkeypatch, self.ENTRY, f"{self.ENTRY}#m", stamp=100)
+        with pytest.raises(SwitchError):
+            _switcher(Platform.WINDOWS).switch_to("1", json_output=True)
+
+    def test_an_opt_in_is_never_acknowledged(self, windows, temp_home):
+        _enable_flag(temp_home)
+        forced = _switcher(Platform.WINDOWS)
+        forced.ignore_credman = True
+        forced.switch_to("2", json_output=True)
+
+        assert not (forced.backup_dir / windows_credman.ACK_FILE).exists()
+        with pytest.raises(SwitchError, match="is using Windows Credential Manager"):
+            _switcher(Platform.WINDOWS).switch_to("1", json_output=True)
+
+    def test_background_refresh_leaves_a_credman_login_alone(
+        self, windows, monkeypatch
+    ):
+        """cswap's usage pass would find no usable file login, restore the
+        backup and POST its grant — the generation Claude Code may hold in
+        Credential Manager. In that mode it defers instead."""
+        from claude_swap import oauth
+
+        login = json.dumps({"claudeAiOauth": {
+            "accessToken": "fake-1", "refreshToken": "fake-rt-1",
+            "expiresAt": 9999999999000}})
+        windows.write_text(login)
+        sw = _switcher(Platform.WINDOWS)
+        sw._write_account_credentials("1", "1@x.com", login)
+        _targets(monkeypatch, self.ENTRY, stamp=100)
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  return_value=oauth.UsageOutcome(None, "http-401")),
+            patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                  return_value=oauth.RefreshOutcome(None, "refresh-failed")) as post,
+        ):
+            record = sw._fetch_active_usage("1", "1@x.com", login)
+
+        assert not post.called, "POSTed the grant in Credential Manager mode"
+        assert record.error == "http-401"
+        assert windows.read_text() == login
+
+        # Acknowledged as a leftover: the refresh runs again.
+        (sw.backup_dir / windows_credman.ACK_FILE).write_text(
+            json.dumps({self.ENTRY: 100}))
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  return_value=oauth.UsageOutcome(None, "http-401")),
+            patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                  return_value=oauth.RefreshOutcome(None, "refresh-failed")) as post,
+        ):
+            sw._fetch_active_usage("1", "1@x.com", login)
+        assert post.called
+
+
 class _Launched(Exception):
     pass
 
@@ -313,6 +432,24 @@ class TestSessionOnWindows:
         monkeypatch.setenv("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN", "1")
         sw.ignore_credman = True
         with pytest.raises(_Launched):
+            manager.run("2", [])
+
+    def test_override_accepts_a_leftover_profile_entry_until_it_changes(
+        self, run_session, monkeypatch
+    ):
+        sw, manager, profile = run_session
+        entry = f"{keychain_service_name(str(profile))}/user"
+        _targets(monkeypatch, entry, stamp=5)
+        with pytest.raises(SessionError, match="running once with the override"):
+            manager.run("2", [])
+        sw.ignore_credman = True
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+        sw.ignore_credman = False
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+        _targets(monkeypatch, entry, stamp=6)
+        with pytest.raises(SessionError):
             manager.run("2", [])
 
     def test_other_platforms_unaffected(self, run_session, monkeypatch):
@@ -427,11 +564,23 @@ class TestRealCredentialManager:
 
     def test_enumeration_finds_exactly_this_service(self, entry):
         service = f"cswap-ci-{uuid.uuid4().hex[:8]}"
-        assert REAL_ENUMERATE(f"{service}/*") == []
+        assert REAL_ENUMERATE(f"{service}/*") == {}
         entry(f"{service}/user")
         entry(f"{service}/user#m")
         entry(f"{service}-other/user")
         assert sorted(REAL_ENUMERATE(f"{service}/*")) == [f"{service}/user", f"{service}/user#m"]
+
+    def test_last_written_is_read_and_moves_on_a_rewrite(self, entry):
+        import time
+
+        service = f"cswap-ci-{uuid.uuid4().hex[:8]}"
+        entry(f"{service}/user")
+        (first,) = REAL_ENUMERATE(f"{service}/*").values()
+        assert first > 0
+        time.sleep(0.05)
+        entry(f"{service}/user")  # what Claude Code does on each refresh
+        (second,) = REAL_ENUMERATE(f"{service}/*").values()
+        assert second > first
 
     def test_entry_present_with_the_real_api(self, entry, monkeypatch):
         monkeypatch.setattr(windows_credman, "_enumerate_targets", REAL_ENUMERATE)
@@ -453,7 +602,7 @@ class TestRealCredentialManager:
             _switcher(Platform.WINDOWS).switch_to("2", json_output=True)
 
         assert windows.read_text() == LIVE
-        assert REAL_ENUMERATE(f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/*") == [target]
+        assert list(REAL_ENUMERATE(f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/*")) == [target]
 
     def test_run_refuses_on_a_real_profile_entry(self, entry, run_session, monkeypatch):
         """A real entry for the session profile's own service makes `cswap
@@ -467,4 +616,4 @@ class TestRealCredentialManager:
             manager.run("2", [])
 
         assert not profile.exists()
-        assert REAL_ENUMERATE(f"{keychain_service_name(str(profile))}/*") == [target]
+        assert list(REAL_ENUMERATE(f"{keychain_service_name(str(profile))}/*")) == [target]

@@ -557,7 +557,7 @@ def block_real_credman(monkeypatch):
     """Safety net: no test may enumerate the real Windows Credential Manager,
     and the developer's own credman opt-in/override env vars never leak in.
     Tests that need the real enumeration call the original function directly."""
-    monkeypatch.setattr(_windows_credman, "_enumerate_targets", lambda _pattern: [])
+    monkeypatch.setattr(_windows_credman, "_enumerate_targets", lambda _pattern: {})
     monkeypatch.delenv(_windows_credman.FORCE_ENV, raising=False)
     monkeypatch.delenv(_windows_credman.IGNORE_ENV, raising=False)
 

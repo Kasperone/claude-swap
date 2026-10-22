@@ -557,6 +557,7 @@ def _assign_design_oauth(
         mark_foreign_design,
         profile_is_quiescent,
         read_profile_design,
+        strip_live_profile_design,
         strip_profile_design_oauth,
     )
 
@@ -710,20 +711,25 @@ def _assign_design_oauth(
         if fp not in owners or owners[fp] == num:
             continue
         if not profile_is_quiescent(session_dir):
-            # Not rewritten under a running claude: marked instead. From now
-            # on the copy is ignored for this account, and it is stripped
+            # A claude runs in it: the copy is stripped under the profile's
+            # own Claude Code locks, before that claude can refresh it (which
+            # would spend the owner's). Marked as well: from now on the copy
+            # is ignored for this account, should it come back or the strip
+            # not land (the profile's locks busy), and the marker settles
             # once the profile is quiescent (next run/adoption).
-            if mark_foreign_design(session_dir, fp):
+            stripped = strip_live_profile_design(session_dir, {fp})
+            if mark_foreign_design(session_dir, fp) or stripped:
                 changed += 1
                 log.info(
                     f"{tag}: Account-{num} session profile holds Design login "
                     f"{fp} (Account-{owners[fp]}'s); a claude is running in it, "
-                    "marked for removal once it exits"
+                    + ("removed under its locks" if stripped
+                       else "marked for removal once it exits")
                 )
             else:
                 log.warning(
-                    f"{tag}: Account-{num} session profile: could not mark "
-                    f"Design login {fp} for removal"
+                    f"{tag}: Account-{num} session profile: could not remove or "
+                    f"mark Design login {fp}"
                 )
             continue
         if strip_profile_design_oauth(session_dir, only={fp}):
@@ -779,11 +785,13 @@ def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
        their ``.prev``, and session profiles). A family whose owner cannot be
        told apart is left untouched everywhere, with a warning — the
        migration never strips an account of a copy that may be its own.
-    3. A session profile is rewritten only while no claude runs in it. A live
-       one is marked instead (``FOREIGN_DESIGN_MARKER``, fingerprints only):
-       the copy is ignored for that account from then on and stripped when
-       the profile is next quiescent, so the migration itself still
-       completes.
+    3. A session profile a claude runs in is rewritten under that profile's
+       own Claude Code locks (:func:`~claude_swap.session.strip_live_profile_design`),
+       before the running claude can refresh the copy and spend the owner's.
+       It is also marked (``FOREIGN_DESIGN_MARKER``, fingerprints only): the
+       copy is ignored for that account from then on, should it come back or
+       the strip not land (locks busy), and the marker settles when the
+       profile is next quiescent, so the migration itself still completes.
 
     A one-shot: recorded under the versioned id ``DESIGN_MIGRATION_ID``
     before the lock is released, and re-checked under the lock, so

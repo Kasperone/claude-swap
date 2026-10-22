@@ -49,7 +49,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain, windows_credman
-from claude_swap.claude_locks import proper_lockfile
+from claude_swap.claude_locks import (
+    claude_credentials_lock,
+    claude_store_locks,
+    proper_lockfile,
+)
 from claude_swap.credentials import (
     design_fingerprint,
     design_oauth_of,
@@ -60,6 +64,7 @@ from claude_swap.credentials import (
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    LockError,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
@@ -379,17 +384,20 @@ def _profile_design_oauth(session_dir: Path, own_only: bool = True) -> dict | No
     return own_design_oauth(session_dir, design) if own_only else design
 
 
-def read_profile_design(session_dir: Path) -> tuple[dict | None, bool]:
+def read_profile_design(
+    session_dir: Path, strict: bool = False
+) -> tuple[dict | None, bool]:
     """The profile's raw ``designOauth`` and whether its store was readable.
 
     Same read order as :func:`_profile_design_oauth`. ``(None, True)`` when
     there is none (no item, no file); ``(None, False)`` when the first item
-    or the file could not be read.
+    or the file could not be read. ``strict`` retries an unreadable Keychain
+    item once, for callers about to delete it.
     """
     if Platform.detect() == Platform.MACOS:
         for service in _keychain_services(str(session_dir)):
             try:
-                value = _keychain_entry(service, strict=False)
+                value = _keychain_entry(service, strict=strict)
             except macos_keychain.KEYCHAIN_ERRORS:
                 return None, False
             if value is not None:
@@ -404,19 +412,93 @@ def read_profile_design(session_dir: Path) -> tuple[dict | None, bool]:
 
 
 def settle_foreign_design(session_dir: Path) -> None:
-    """Strip a marked foreign Design login once the profile is quiescent.
+    """Strip a marked foreign Design login from a profile.
 
-    Caller holds cswap's lock. A no-op without a marker, or while a claude
-    runs in the profile (the marker then keeps the copy ignored).
+    Caller holds cswap's lock. A no-op without a marker. While a claude runs
+    in the profile the copy is stripped under its locks
+    (:func:`strip_live_profile_design`) and the marker stays, so the copy is
+    still ignored should that claude write it back; once quiescent, the strip
+    clears the marker.
     """
     if not foreign_design_marker_for(session_dir).exists():
         return
+    listed = foreign_design_fingerprints(session_dir)
     if not profile_is_quiescent(session_dir):
+        strip_live_profile_design(session_dir, listed)
         return
-    if strip_profile_design_oauth(
-        session_dir, only=foreign_design_fingerprints(session_dir)
-    ):
+    if strip_profile_design_oauth(session_dir, only=listed):
         clear_foreign_design(session_dir)
+
+
+# A claude in the profile may be mid-refresh: never wait long on its locks
+# from a migration or a usage pass. A busy profile is retried on a later one.
+_LIVE_STRIP_LOCK_TIMEOUT = 2.0
+
+
+def strip_live_profile_design(session_dir: Path, only: set[str]) -> bool:
+    """Remove listed (other accounts') Design logins from a running profile.
+
+    The claude running there would otherwise keep using that copy, and its
+    next Design refresh would spend the refresh token the owner's copies
+    hold: the owner's Design login dies, and the refreshed generation, no
+    longer listed, would read as this account's own.
+
+    Done under the profile's own Claude Code locks, briefly
+    (``claude_credentials_lock`` and ``claude_store_locks`` for its
+    directory): no refresh of it is in flight, and the rewrite lands between
+    Claude Code's own writes, which re-read the store. Each store still
+    holding a listed copy — the profile's Keychain item(s) on macOS, its
+    plaintext file — is rewritten in place with the same blob minus
+    ``designOauth``, the way cswap rewrites the default store under a running
+    claude on every switch. Returns whether no listed copy remains; ``False``
+    (locks busy, a store unreadable or not writable) leaves it to the caller's
+    marker.
+    """
+    try:
+        with (
+            claude_credentials_lock(
+                timeout=_LIVE_STRIP_LOCK_TIMEOUT, config_home=session_dir
+            ),
+            claude_store_locks(session_dir, timeout=_LIVE_STRIP_LOCK_TIMEOUT),
+        ):
+            return _strip_listed_design_in_place(session_dir, only)
+    except LockError:
+        return False
+
+
+def _strip_listed_design_in_place(session_dir: Path, only: set[str]) -> bool:
+    """Rewrite every store of the profile holding a listed Design login
+    without it. Caller holds the profile's Claude Code locks."""
+    holders: list[tuple[str | None, dict]] = []  # (Keychain service | file, blob)
+    if Platform.detect() == Platform.MACOS:
+        for service in _keychain_services(str(session_dir)):
+            try:
+                value = _keychain_entry(service, strict=True)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return False
+            if value is not None and design_fingerprint(design_oauth_of(value)) in only:
+                holders.append((service, json.loads(value)))
+    creds_path = session_dir / ".credentials.json"
+    try:
+        text = creds_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    except (OSError, ValueError):
+        return False
+    if text is not None and design_fingerprint(design_oauth_of(text)) in only:
+        holders.append((None, json.loads(text)))
+    for service, blob in holders:
+        blob.pop("designOauth", None)
+        try:
+            if service is None:
+                atomic_write_json(creds_path, blob)
+            else:
+                macos_keychain.set_password(
+                    service, _keychain_account_name(), json.dumps(blob)
+                )
+        except macos_keychain.KEYCHAIN_ERRORS:  # OSError included
+            return False
+    return True
 
 
 def strip_profile_design_oauth(
@@ -878,20 +960,33 @@ class SessionManager:
         effect. Checked: the opt-in env var, the cached flag of the default
         profile (a rollout reaches every profile) and of the session profile,
         and an entry for the profile's own service. Presence only, as for the
-        switch (see :mod:`windows_credman`). No-op off Windows and with
-        ``ignore_credman`` (``CSWAP_IGNORE_CREDMAN=1``).
+        switch (see :mod:`windows_credman`). No-op off Windows, with
+        ``ignore_credman`` (``CSWAP_IGNORE_CREDMAN=1``, which also remembers a
+        profile entry as stale), and for such an entry Claude Code has not
+        written since.
         """
-        if self.switcher.platform != Platform.WINDOWS or self.switcher.ignore_credman:
+        if self.switcher.platform != Platform.WINDOWS:
             return
         mode = windows_credman.detect([]) or windows_credman.detect(
             [keychain_service_name(str(session_dir))], config_dir=session_dir
         )
         if mode is None:
             return
+        acks = self.switcher.backup_dir / windows_credman.ACK_FILE
+        if windows_credman.acknowledged(mode, acks):
+            return
+        if self.switcher.ignore_credman:
+            windows_credman.acknowledge(mode, acks)
+            return
         lead = (
             "Claude Code is using Windows Credential Manager"
             if mode.state == windows_credman.ACTIVE
             else "Claude Code may be using Windows Credential Manager"
+        )
+        stale = (
+            " If that entry is a leftover, running once with the override makes "
+            "cswap accept it until Claude Code writes it again."
+            if mode.entries else ""
         )
         raise SessionError(
             f"{lead} ({mode.reason}). A session would move its login there, "
@@ -899,7 +994,7 @@ class SessionManager:
             "stored backup would fall behind the session's refreshed token. "
             "cswap does not support Credential Manager and leaves it untouched. "
             f"To run anyway (e.g. after turning the mode off), set "
-            f"{windows_credman.IGNORE_ENV}=1."
+            f"{windows_credman.IGNORE_ENV}=1.{stale}"
         )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -1051,8 +1146,9 @@ class SessionManager:
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
-                self.switcher._invalidate_session_credentials(account_num, email)
-                clear_session_stale(session_dir)
+                # Unreadable (False): the marker stays for a later run.
+                if self.switcher._invalidate_session_credentials(account_num, email):
+                    clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
                 # Valid, but possibly not on the generation WE just paid for.
                 # The consume above runs outside this lock (it POSTs), so a
@@ -1151,15 +1247,25 @@ class SessionManager:
         # the delete below removes the hashed item. Not from a profile an
         # in-session /login re-pointed at another account: its Design login
         # is that account's.
+        design, readable = read_profile_design(session_dir, strict=True)
         profile_design = (
             None
             if session_identity_drifted(session_dir, email, org_uuid)
-            else _profile_design_oauth(session_dir)
+            else own_design_oauth(session_dir, design)
         )
 
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
+        # Never one that could not be read, though: it may hold the only copy
+        # of a newer Design login. It stays, and the profile is flagged for
+        # another re-seed once the Keychain reads again (below).
+        if readable:
+            delete_macos_keychain_entry(session_dir)
+        else:
+            self._logger.warning(
+                f"Account {account_num}'s session Keychain item could not be "
+                "read; re-seeding without deleting it, and again on a later run"
+            )
 
         creds, unreadable = self.switcher._read_account_credentials_ex(
             account_num, email
@@ -1231,9 +1337,12 @@ class SessionManager:
         if sys.platform != "win32":
             os.chmod(config_path, 0o600)
 
-        # The seed carries no foreign Design login (the backup holds only this
-        # account's, and a marked profile copy was ignored above).
-        clear_foreign_design(session_dir)
+        if readable:
+            # The seed carries no foreign Design login (the backup holds only
+            # this account's, and a marked profile copy was ignored above).
+            clear_foreign_design(session_dir)
+        else:
+            mark_session_stale(session_dir)
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
@@ -1252,11 +1361,23 @@ class SessionManager:
         # The login failed validation, not the Design login: keep a newer one
         # of this account's in its backup before the profile goes.
         try:
-            self.switcher._adopt_session_design(account_num, email, org_uuid)
+            kept = self.switcher._adopt_session_design(
+                account_num,
+                email,
+                org_uuid,
+                read=read_profile_design(session_dir, strict=True),
+            )
         except Exception as e:
             self._logger.warning(
                 f"Could not keep account {account_num}'s session Design login: {e}"
             )
+            kept = None
+        if kept is None:
+            # Its store (or the backup) could not be read, so a newer Design
+            # login in it could not be kept: the profile stays, flagged for a
+            # re-seed, which keeps that login once it reads again.
+            mark_session_stale(session_dir)
+            return
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
         # stale marker is a sibling, so rmtree does not take it.

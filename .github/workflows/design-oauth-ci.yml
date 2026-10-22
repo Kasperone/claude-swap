@@ -74,7 +74,7 @@ jobs:
         run: >
           uv run pytest -o faulthandler_timeout=300 -v -rs -n 0
           tests/test_design_oauth_windows.py tests/test_windows_credman.py
-          tests/test_design_oauth_per_account.py
+          tests/test_design_oauth_per_account.py tests/test_design_oauth_seamless.py
 
       - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
         shell: bash
@@ -111,6 +111,25 @@ jobs:
             ARGS+=("$VERSION=$DIR/extract/package/$BIN")
           done
           uv run python .github/scripts/check_claude_code_keychain.py "${ARGS[@]}"
+
+      - name: Run the real Claude Code next to cswap (Linux; no network, fake credentials)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The tests run the binaries downloaded above, each call inside
+          # `unshare -rn` (a network namespace with no route out), and refuse
+          # to run them otherwise. Ubuntu 24.04 restricts unprivileged user
+          # namespaces through AppArmor; lift that for this runner.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn true
+          shopt -s nullglob
+          BINARIES=("$RUNNER_TEMP"/cc-*/extract/package/claude)
+          [ ${#BINARIES[@]} -gt 0 ] || { echo "::error::no Claude Code binary"; exit 1; }
+          for BINARY in "${BINARIES[@]}"; do
+            echo "== $BINARY"
+            CSWAP_CC_BINARY="$BINARY" uv run pytest -v -rs -n 0 \
+              -o faulthandler_timeout=300 tests/test_claude_code_behaviour.py
+          done
 
       - name: Delete temporary keychain (macOS)
         if: always() && runner.os == 'macOS'

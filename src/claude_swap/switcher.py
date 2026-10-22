@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -27,7 +28,12 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth, pace, windows_credman
-from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
+from claude_swap.claude_locks import (
+    claude_config_lock,
+    claude_credentials_lock,
+    claude_store_locks,
+    claude_store_write_lock,
+)
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
@@ -2632,6 +2638,13 @@ class ClaudeAccountSwitcher:
             # cannot raise past its own store write. Open-coding the split
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
+            #
+            # The stash holds a login successor only. Its Design login is the
+            # one from before that POST; the store's may have changed since
+            # (a session adoption, the per-account migration) and stays.
+            store_design = design_oauth_of(current)
+            if design_oauth_of(creds) != store_design:
+                creds = with_design_oauth(creds, store_design)
             self._write_account_credentials(account_num, email, creds)
             # Housekeeping, and non-fatal for the same reason: the slot is
             # advanced, so a raise would report a failed refresh for a
@@ -2801,34 +2814,54 @@ class ClaudeAccountSwitcher:
                 f"retry {action}."
             )
 
-    def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
+    def _invalidate_session_credentials(self, account_num: str, email: str) -> bool:
         """Drop a session profile's credential material, keeping its history.
 
         The next `cswap run` fails the reuse check and re-bootstraps from
         backup; the bootstrap merges .claude.json, so the profile's own
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
+
+        Returns ``False`` only when a newer Design login in the profile could
+        not be kept (its Keychain item or the backup unreadable, or the
+        adoption failing): then nothing is deleted and the profile is marked
+        stale instead (as for a live one), to be invalidated once it can be.
         """
         from claude_swap.session import (
             clear_foreign_design,
             clear_session_stale,
             delete_macos_keychain_entry,
+            mark_session_stale,
+            read_profile_design,
         )
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
-            return
+            return True
         # The profile may hold a newer Design login of this account than
         # the backup (a /design-login not adopted yet): keep it in the
-        # backup before the profile's credential material goes.
+        # backup before the profile's credential material goes. When that
+        # cannot be decided (its Keychain item or the backup is unreadable,
+        # or the write failed), nothing is deleted.
         try:
-            self._adopt_session_design(
-                account_num, email, self._slot_org_uuid(account_num)
+            kept = self._adopt_session_design(
+                account_num,
+                email,
+                self._slot_org_uuid(account_num),
+                read=read_profile_design(session_dir, strict=True),
             )
-        except Exception as e:  # never block the invalidation itself
+        except Exception as e:
             self._logger.warning(
                 f"Could not keep account {account_num}'s session Design login: {e}"
             )
+            kept = None
+        if kept is None:
+            mark_session_stale(session_dir)
+            self._logger.warning(
+                f"Account {account_num}'s session profile could not be checked "
+                "for a newer Design login; marked stale instead of invalidated"
+            )
+            return False
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
@@ -2836,6 +2869,7 @@ class ClaudeAccountSwitcher:
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )
+        return True
 
     def _slot_org_uuid(self, account_num: str) -> str:
         """The slot's stored organization uuid ("" when unknown)."""
@@ -2945,12 +2979,13 @@ class ClaudeAccountSwitcher:
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
+            # Another account's Design login the migration marked in the
+            # profile: strip it now (under the profile's own locks while a
+            # claude runs there), before anything reads the profile for this
+            # account.
+            settle_foreign_design(session_dir)
             if not profile_is_quiescent(session_dir):
                 return None
-            # Another account's Design login the migration found in the
-            # profile while it was live: strip it now, before anything reads
-            # the profile for this account.
-            settle_foreign_design(session_dir)
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
                 self._adopt_session_design(account_num, email, org_uuid)
@@ -2990,9 +3025,106 @@ class ClaudeAccountSwitcher:
             ),
         )
 
+    @staticmethod
+    def _capture_keeping_design(live: str, backup: str | None) -> str:
+        """The live credential as it may be captured into its account's backup.
+
+        The live Design login is the account's own, but the backup can hold a
+        later generation of it: one adopted from the account's own session
+        while it was also the default login, which then spent the live copy.
+        The later of the two is kept (the live one on a tie, or when the
+        backup has none), so a capture never puts a spent generation over
+        the one the account uses next. Unchanged bytes when the live copy wins.
+        """
+        live_design = design_oauth_of(live)
+        kept = newer_design_oauth(live_design, design_oauth_of(backup))
+        return live if kept is live_design else with_design_oauth(live, kept)
+
+    @staticmethod
+    def _with_store_design(
+        working: str, start_design: dict | None, now_design: dict | None
+    ) -> str:
+        """``working`` as a post-POST write may put it into the live store.
+
+        A cswap refresh renews only the login; the Design login belongs to
+        Claude Code, which refreshes it under a lock of its own, so it may
+        have saved a newer one (or cleared a dead one) while cswap's POST was
+        in flight. When the store's copy changed since ``start_design`` was
+        read, the store's current copy (``now_design``) wins, absence
+        included. Otherwise the later of the store's and ``working``'s (which
+        comes from the backup when the live login was restored from it).
+        """
+        working_design = design_oauth_of(working)
+        if now_design != start_design:
+            kept = now_design
+        else:
+            kept = newer_design_oauth(now_design, working_design)
+        return working if kept == working_design else with_design_oauth(working, kept)
+
+    def _keep_store_design(self, working: str, start: str | None) -> str:
+        """:meth:`_with_store_design` against the live store's Design login
+        now; ``working`` unchanged when the store cannot be read."""
+        now_design, readable = self._store.live_design_oauth()
+        if not readable:
+            return working
+        return self._with_store_design(working, design_oauth_of(start), now_design)
+
+    @contextmanager
+    def _store_write_guard(self):
+        """Claude Code's store write lock, best effort; yields whether it is held.
+
+        For a write that must land even without it (the successor of a
+        consumed grant): a lock not held only means the Design login is
+        merged without that guarantee, never that the write is skipped.
+        Claude Code holds it for a local read-modify-write only, so the wait
+        is short.
+        """
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(claude_store_write_lock(timeout=3.0))
+            except (LockError, OSError) as e:
+                self._logger.warning(
+                    "Claude Code's store write lock is busy (%s); writing "
+                    "the active credential without it.", e,
+                )
+                yield False
+            else:
+                yield True
+
+    def _keep_design_of_wiped_login(
+        self, account_num: str, email: str, live: str
+    ) -> None:
+        """Keep a wiped live login's Design login in the account's backup.
+
+        Claude Code's ``invalid_grant`` reaction empties only the login's
+        tokens and leaves the rest of the blob, Design login included; that
+        copy may be newer than the backup's (Claude Code refreshed it since
+        the last capture, spending the backup's). The backup's login stays as
+        it is; only a strictly newer Design login is written in.
+        """
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable or not backup:
+            return
+        backup_design = design_oauth_of(backup)
+        kept = newer_design_oauth(backup_design, design_oauth_of(live))
+        if kept is backup_design:
+            return
+        updated = with_design_oauth(backup, kept)
+        if updated == backup:
+            return  # an API-key slot owns no Design login
+        self._store._write_account_credentials(account_num, email, updated)
+        self._logger.info(
+            f"Kept account {account_num}'s Design login ({design_fingerprint(kept)}) "
+            "from its wiped live login"
+        )
+
     def _adopt_session_design(
-        self, account_num: str, email: str, org_uuid: str
-    ) -> bool:
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        read: tuple[dict | None, bool] | None = None,
+    ) -> bool | None:
         """Capture a quiescent profile's newer Design login into the slot backup.
 
         ``/design-login`` inside ``cswap run`` writes ``designOauth`` into the
@@ -3008,16 +3140,24 @@ class ClaudeAccountSwitcher:
         or are invalidating the profile under it): the profile must be
         readable as this account, a copy marked as another account's is
         ignored, and an unreadable backup writes nothing. Returns whether it
-        wrote.
+        wrote, or ``None`` when that could not be decided (the profile's store
+        or the backup was unreadable): a caller about to delete the profile's
+        credential must not, then. ``read`` is a
+        :func:`~claude_swap.session.read_profile_design` result the caller
+        already holds, so the copy it deletes is the copy that was judged.
         """
         from claude_swap.session import (
-            _profile_design_oauth,
+            own_design_oauth,
+            read_profile_design,
             read_session_identity,
             session_identity_drifted,
         )
 
         session_dir = self._session_dir(account_num, email)
-        profile_design = _profile_design_oauth(session_dir)
+        raw, readable = read if read is not None else read_profile_design(session_dir)
+        if not readable:
+            return None
+        profile_design = own_design_oauth(session_dir, raw)
         if profile_design is None:
             return False
         if read_session_identity(session_dir) is None or session_identity_drifted(
@@ -3025,7 +3165,9 @@ class ClaudeAccountSwitcher:
         ):
             return False
         backup, unreadable = self._read_account_credentials_ex(account_num, email)
-        if unreadable or not backup:
+        if unreadable:
+            return None
+        if not backup:
             return False
         backup_design = design_oauth_of(backup)
         if profile_design == backup_design:
@@ -4408,6 +4550,15 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
+        # Windows Credential Manager mode (see _refuse_windows_credman): the
+        # live login is in Credential Manager, not in the file this path
+        # reads and writes. Seeing no file, it would restore the backup and
+        # POST its grant — which spends the login Claude Code holds there
+        # whenever both are still the same generation. Leave it to Claude
+        # Code, as a switch would.
+        if self._windows_credman_mode(record_override=False) is not None:
+            return _defer(force_refresh)
+
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
         # outright: attributable live → refresh it; unattributable live but
@@ -4536,7 +4687,13 @@ class ClaudeAccountSwitcher:
                     ):
                         try:
                             self._write_account_credentials(
-                                account_num, email, live
+                                account_num, email,
+                                self._capture_keeping_design(
+                                    live,
+                                    self._read_account_credentials(
+                                        account_num, email
+                                    ),
+                                ),
                             )
                         except Exception:
                             self._logger.warning(
@@ -4741,11 +4898,23 @@ class ClaudeAccountSwitcher:
                     # least one of them. Attempt both; tolerate either
                     # failing alone. (For a restore, the backup already holds
                     # it; only the live store needs the write.)
+                    #
+                    # Claude Code may have saved a newer Design login while
+                    # the POST was in flight (its refresh does not take the
+                    # locks held here): keep it, in the backup and again,
+                    # under its store write lock, in the live write itself.
+                    working = self._keep_store_design(working, live)
                     backup_ok = live_ok = True
                     if restore_source is None:
                         try:
                             self._write_account_credentials(
-                                account_num, email, working
+                                account_num, email,
+                                self._capture_keeping_design(
+                                    working,
+                                    self._read_account_credentials(
+                                        account_num, email
+                                    ),
+                                ),
                             )
                         except Exception:
                             backup_ok = False
@@ -4760,7 +4929,12 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
-                        with claude_config_lock():
+                        with (
+                            claude_config_lock(),
+                            self._store_write_guard() as guarded,
+                        ):
+                            if guarded:
+                                working = self._keep_store_design(working, live)
                             self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
@@ -4932,7 +5106,12 @@ class ClaudeAccountSwitcher:
                     == oauth.credential_fingerprint(creds)
                 ):
                     return
-                self._write_account_credentials(account_num, email, live)
+                self._write_account_credentials(
+                    account_num, email,
+                    self._capture_keeping_design(
+                        live, self._read_account_credentials(account_num, email)
+                    ),
+                )
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",
@@ -6902,13 +7081,10 @@ class ClaudeAccountSwitcher:
         deleted that file when it moved there, so the switch would silently
         not take effect. Detection reads presence/flags only and never
         touches the Credential Manager entry (see :mod:`windows_credman`).
-        No-op off Windows and with ``ignore_credman``.
+        No-op off Windows, with ``ignore_credman``, and for an entry the user
+        overrode before that Claude Code has not written since.
         """
-        if self.platform != Platform.WINDOWS or self.ignore_credman:
-            return
-        from claude_swap.credentials import _active_oauth_keychain_services
-
-        mode = windows_credman.detect(_active_oauth_keychain_services())
+        mode = self._windows_credman_mode(record_override=True)
         if mode is None:
             return
         lead = (
@@ -6916,14 +7092,48 @@ class ClaudeAccountSwitcher:
             if mode.state == windows_credman.ACTIVE
             else "Claude Code may be using Windows Credential Manager"
         )
+        stale = (
+            " If that entry is a leftover (the mode was turned off), switch "
+            "once with --ignore-credman: cswap then accepts that entry until "
+            "Claude Code writes it again."
+            if mode.entries else ""
+        )
         raise SwitchError(
             f"{lead} for its login ({mode.reason}). cswap switches by writing "
             f"{get_credentials_path()}, which Claude Code does not read in that "
             "mode, so the switch would silently not take effect. cswap does not "
             "support Credential Manager and leaves it untouched. To switch "
             "anyway (e.g. after turning the mode off), re-run with "
-            f"--ignore-credman or set {windows_credman.IGNORE_ENV}=1."
+            f"--ignore-credman or set {windows_credman.IGNORE_ENV}=1.{stale}"
         )
+
+    def _windows_credman_mode(
+        self, record_override: bool
+    ) -> "windows_credman.CredmanMode | None":
+        """Claude Code's Credential Manager mode, when it should stop a write
+        to the active store; ``None`` off Windows or when nothing should.
+
+        An ambiguity resting on entries alone is accepted once the user
+        overrode it and those entries are unchanged (``windows_credman``
+        acknowledgments). ``ignore_credman`` accepts anything; with
+        ``record_override`` (a switch the user forced) such entries are
+        remembered as stale.
+        """
+        if self.platform != Platform.WINDOWS:
+            return None
+        from claude_swap.credentials import _active_oauth_keychain_services
+
+        mode = windows_credman.detect(_active_oauth_keychain_services())
+        if mode is None:
+            return None
+        acks = self.backup_dir / windows_credman.ACK_FILE
+        if windows_credman.acknowledged(mode, acks):
+            return None
+        if self.ignore_credman:
+            if record_override:
+                windows_credman.acknowledge(mode, acks)
+            return None
+        return mode
 
     def _perform_switch(
         self,
@@ -7047,9 +7257,18 @@ class ClaudeAccountSwitcher:
         # means a mid-refresh Claude Code either finishes before our swap
         # (backup captures the rotated token) or re-checks after it and aborts.
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
-        # interleaving with Claude Code's own config writes. Everything under
-        # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        # interleaving with Claude Code's own config writes. The store locks
+        # (claude_store_locks) do the same for the Design and cloud-sessions
+        # refreshes, whose CAS save would otherwise revoke the outgoing
+        # account's freshly issued token when the switch lands mid-POST, and
+        # for every other Claude Code store write. Everything under here is
+        # local I/O — no network while locks are held.
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+            claude_store_locks(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -7365,6 +7584,11 @@ class ClaudeAccountSwitcher:
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
+                    # The wipe left the rest of the blob alone: a newer
+                    # Design login in it is still this account's.
+                    self._keep_design_of_wiped_login(
+                        current_account, current_email, original_creds
+                    )
                     msg = (
                         "The live credential's tokens were wiped (Claude "
                         "Code clears them when a refresh is rejected). "
@@ -7388,7 +7612,13 @@ class ClaudeAccountSwitcher:
                     # indistinguishable from a legitimate rotation, so a
                     # warning would cry wolf.
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email,
+                        self._capture_keeping_design(
+                            original_creds,
+                            self._read_account_credentials(
+                                current_account, current_email
+                            ),
+                        ),
                     )
                     self._write_account_config(
                         current_account, current_email, original_config
@@ -7413,7 +7643,13 @@ class ClaudeAccountSwitcher:
                     )
                 else:  # own-family / own-rotated
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email,
+                        self._capture_keeping_design(
+                            original_creds,
+                            self._read_account_credentials(
+                                current_account, current_email
+                            ),
+                        ),
                     )
                     self._write_account_config(
                         current_account, current_email, original_config

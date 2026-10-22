@@ -15,6 +15,9 @@ config file. The protocol (verified against the 2.1.218 bundle):
   stale after 10s, touched every 5s.
 - Claude Code retries a held credentials lock 5 times with 1-2s jittered
   sleeps before giving up, so briefly holding it is fully cooperative.
+- Since 2.1.306 the account-owned sibling logins (Design, cloud sessions)
+  refresh under their own locks, and every store write runs under a store
+  write lock — see :func:`claude_store_locks`.
 
 Holding these locks while swapping credentials closes the one real race with a
 running Claude Code: its refresh reads credentials, refreshes over the network,
@@ -41,7 +44,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeCodeLockTimeout
-from claude_swap.paths import get_claude_config_home, get_global_config_path
+from claude_swap.paths import (
+    get_claude_config_home,
+    get_credentials_path,
+    get_global_config_path,
+)
 
 # Claude Code's credential-refresh locks run ``stale: 60000, update: 5000``
 # (2.1.218 ``uKi``): a lock younger than 60s belongs to a live holder and
@@ -51,6 +58,14 @@ CREDENTIALS_STALENESS_S = 60.0
 # The config lock (~/.claude.json.lock) keeps the older proper-lockfile
 # defaults: stale after 10s, touched every 5s.
 CONFIG_STALENESS_S = 10.0
+# Claude Code's store write lock (``.storage-write`` through proper-lockfile,
+# so the directory ``.storage-write.lock``) runs ``stale: 15000``.
+STORE_WRITE_STALENESS_S = 15.0
+# Lock directories Claude Code keeps beside its credential store (2.1.306 and
+# 2.1.308, see claude_store_locks).
+DESIGN_REFRESH_LOCK = ".design_oauth_refresh.lock"
+CLOUD_SESSIONS_REFRESH_LOCK = ".cloud_sessions_oauth_refresh.lock"
+STORE_WRITE_LOCK = ".storage-write.lock"
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
@@ -63,17 +78,20 @@ DEFAULT_TIMEOUT_S = 9.0
 _logger = logging.getLogger("claude-swap")
 
 
-def credentials_lock_dir() -> Path:
+def credentials_lock_dir(config_home: Path | None = None) -> Path:
     """Legacy credential lock (``~/.claude.lock``) — CC still takes it for
-    compatibility; external exclusion today rests on this one."""
-    home = get_claude_config_home()
+    compatibility; external exclusion today rests on this one. ``config_home``
+    names another profile's (a ``cswap run`` session) instead of the active
+    one."""
+    home = config_home if config_home is not None else get_claude_config_home()
     return home.parent / (home.name + ".lock")
 
 
-def oauth_refresh_lock_dir() -> Path:
+def oauth_refresh_lock_dir(config_home: Path | None = None) -> Path:
     """Claude Code's primary OAuth refresh lock
     (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
-    return get_claude_config_home() / ".oauth_refresh.lock"
+    home = config_home if config_home is not None else get_claude_config_home()
+    return home / ".oauth_refresh.lock"
 
 
 def config_lock_dir() -> Path:
@@ -155,7 +173,9 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(
+    *, timeout: float | None = None, config_home: Path | None = None
+):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
@@ -164,15 +184,16 @@ def claude_credentials_lock(*, timeout: float | None = None):
     cswap and a waiting Claude Code can never deadlock against each other,
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
+    ``config_home`` names another profile's (a ``cswap run`` session).
     """
     with (
         proper_lockfile(
-            oauth_refresh_lock_dir(),
+            oauth_refresh_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
         proper_lockfile(
-            credentials_lock_dir(),
+            credentials_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
@@ -184,4 +205,78 @@ def claude_credentials_lock(*, timeout: float | None = None):
 def claude_config_lock(*, timeout: float | None = None):
     """Hold Claude Code's global-config write lock (``~/.claude.json.lock``)."""
     with proper_lockfile(config_lock_dir(), timeout=timeout):
+        yield
+
+
+def secure_storage_dir() -> Path:
+    """Where Claude Code keeps its credential store and the locks beside it.
+
+    2.1.306/2.1.308 ``UL()``: ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` when defined
+    (empty meaning ``~/.claude``), else the config home — the directory of
+    ``.credentials.json`` (also on macOS, where the store itself is a Keychain
+    item).
+    """
+    return get_credentials_path().parent
+
+
+@contextmanager
+def claude_store_locks(
+    storage_dir: Path | None = None, *, timeout: float | None = None
+):
+    """Hold Claude Code's account-login refresh locks and its store write lock.
+
+    Claude Code (2.1.306 and 2.1.308) refreshes the Design login
+    (``designOauth``) and the cloud-sessions login (``cloudSessionsOauth``)
+    under locks of their own in the secure-storage dir,
+    ``.design_oauth_refresh.lock`` and ``.cloud_sessions_oauth_refresh.lock``
+    (proper-lockfile, ``stale: 60000``, 5 tries). Each is held across re-read
+    -> POST -> save, and the save is a CAS on the refresh token it POSTed:
+    when the store changed meanwhile, Claude Code REVOKES the token it was
+    just issued. A switch landing inside that window kills the outgoing
+    account's login for good: its backup keeps the generation the POST spent,
+    and the one issued for it is revoked. Holding the lock makes such a
+    refresh finish before the switch reads the store, or start after it.
+
+    Every Claude Code store write (``mutate``) runs under
+    ``.storage-write.lock`` (``stale: 15000``, 10 retries) with a fresh read,
+    so holding it too makes cswap's rewrite of the store atomic against all of
+    them (a ``/design-login`` or any other save landing mid-switch).
+
+    Refresh locks first, then the write lock, the way Claude Code nests them;
+    callers take this after ``claude_credentials_lock`` and
+    ``claude_config_lock``. Local I/O only while held. ``storage_dir`` names
+    another profile's store directory (a ``cswap run`` session) instead of
+    the active one.
+    """
+    base = storage_dir if storage_dir is not None else secure_storage_dir()
+    with (
+        proper_lockfile(
+            base / DESIGN_REFRESH_LOCK,
+            timeout=timeout,
+            staleness=CREDENTIALS_STALENESS_S,
+        ),
+        proper_lockfile(
+            base / CLOUD_SESSIONS_REFRESH_LOCK,
+            timeout=timeout,
+            staleness=CREDENTIALS_STALENESS_S,
+        ),
+        claude_store_write_lock(base, timeout=timeout),
+    ):
+        yield
+
+
+@contextmanager
+def claude_store_write_lock(
+    storage_dir: Path | None = None, *, timeout: float | None = None
+):
+    """Hold only Claude Code's store write lock (``.storage-write.lock``).
+
+    Enough for a write that keeps the store's account-owned sibling logins as
+    they are at write time: a refresh Claude Code has in flight then still
+    finds the refresh token it POSTed, and its CAS save succeeds afterwards.
+    """
+    base = storage_dir if storage_dir is not None else secure_storage_dir()
+    with proper_lockfile(
+        base / STORE_WRITE_LOCK, timeout=timeout, staleness=STORE_WRITE_STALENESS_S
+    ):
         yield

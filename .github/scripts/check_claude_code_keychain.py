@@ -16,6 +16,11 @@ asserts the credential-storage logic cswap mirrors is still there:
   plaintext and windows-credman — Linux has no secret-store backend
 * Windows (``*.exe``): Credential Manager is opt-in only; otherwise the
   plaintext file is the store (WINDOWS_CHECKS)
+* the locks cswap holds while it rewrites the store (claude_store_locks): the
+  Design and cloud-sessions refreshes run under their own proper-lockfile
+  dirs in the secure-storage dir, and their CAS save revokes the new token
+  when the store changed; every store write takes ``.storage-write.lock`` and
+  re-reads the store under it
 
 Patterns avoid minified identifiers (they change every release) and anchor on
 string literals and property names instead.
@@ -53,6 +58,30 @@ CHECKS = {
         rb"delete \w+\.cloudSessionsOauth",
     "logout revokes designOauth":
         rb"\?\.designOauth;if\(\w+\?\.refreshToken\)await \w+\(\w+\.refreshToken,\w+\.clientId\)",
+    # cswap holds these while it rewrites the store (claude_locks.claude_store_locks):
+    "Design refresh lock": rb'"\.design_oauth_refresh\.lock"',
+    "cloud-sessions refresh lock": rb'"\.cloud_sessions_oauth_refresh\.lock"',
+    "refresh locks are proper-lockfile dirs in the secure-storage dir, stale 60s":
+        rb"let \w+=\w+\(\);await \w+\(\)\.mkdir\(\w+\);let \w+=\w+\(\w+,\w+\),\w+=!1,"
+        rb"\w+,\w+=0;while\(!\w+\)\{\w+\+\+;try\{\w+=await \w+\(\w+,\{lockfilePath:\w+,"
+        rb"realpath:!1,stale:60000",
+    "store writes take .storage-write (proper-lockfile: .storage-write.lock), stale 15s":
+        rb'\w+\(\w+\(\w+,"\.storage-write"\),\{realpath:!1,retries:\{retries:\d+,'
+        rb"minTimeout:\d+,maxTimeout:\d+\},stale:15000",
+    "store writes re-read the store under that lock":
+        rb"\.invalidateCache\?\.\(\);let \w+=await\(\w+\.readAsyncStrict\?\.",
+    # Why the switch must hold the Design refresh lock: a store that changed
+    # under the refresh makes Claude Code revoke the token it was just issued.
+    "Design save is a CAS that revokes its new token on a race":
+        rb"onlyIf:\(\w+\)=>\w+\?\.refreshToken===\w+\}\);if\(\w+\.raced\)\{await "
+        rb"\w+\(\w+\.refreshToken,\w+\.clientId\);let \w+=await \w+\(\);return "
+        rb"\w+\?\.accessToken&&!\w+\(\w+\.expiresAt\)\?\{ok:!0,accessToken:"
+        rb'\w+\.accessToken\}:\{ok:!1,reason:"needs_design_login"\}',
+    # A wiped login keeps its siblings, Design login included (why a switch
+    # still captures a wiped login's Design login).
+    "invalid_grant wipe empties only the login's tokens":
+        rb'\{\.\.\.\w+,claudeAiOauth:\{\.\.\.\w+,refreshToken:"",accessToken:"",'
+        rb"expiresAt:0\}\}",
 }
 
 # win32 builds only (``claude.exe``): the plaintext file stays the store unless
@@ -115,7 +144,13 @@ def check_binary(label: str, path: str) -> list[str]:
 
 
 def check_cswap() -> None:
-    from claude_swap import macos_keychain
+    from claude_swap import claude_locks, macos_keychain
+
+    assert claude_locks.DESIGN_REFRESH_LOCK == ".design_oauth_refresh.lock"
+    assert claude_locks.CLOUD_SESSIONS_REFRESH_LOCK == ".cloud_sessions_oauth_refresh.lock"
+    assert claude_locks.STORE_WRITE_LOCK == ".storage-write.lock"
+    assert claude_locks.STORE_WRITE_STALENESS_S == 15.0
+    assert claude_locks.CREDENTIALS_STALENESS_S == 60.0
     from claude_swap.credentials import (
         ACCOUNT_CREDENTIAL_KEYS,
         CLAUDE_CODE_KEYCHAIN_SERVICE,

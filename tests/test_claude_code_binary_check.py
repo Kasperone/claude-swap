@@ -19,6 +19,12 @@ let e=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;if(e!==void 0)return(e||u(o(),
 new Set(["keychain","plaintext","windows-credman"])
 delete e.claudeAiOauth,delete e.organizationUuid,delete e.designOauth,delete e.cloudSessionsOauth,e}
 let m=e?.designOauth;if(m?.refreshToken)await X_(m.refreshToken,m.clientId)
+var w=".design_oauth_refresh.lock";var U=".cloud_sessions_oauth_refresh.lock";
+let s=UL();await ie().mkdir(s);let i=f(s,o),a=!1,r,l=0;while(!r){l++;try{r=await yl(i,{lockfilePath:i,realpath:!1,stale:60000,update:5000})}catch{}}
+let a=await yl(H(o,".storage-write"),{realpath:!1,retries:{retries:10,minTimeout:100,maxTimeout:1000},stale:15000});
+e.invalidateCache?.();let o=await(e.readAsyncStrict?.(n,{}));
+let u=await NHn(k,{onlyIf:(i)=>i?.refreshToken===c});if(u.raced){await sb(e.refreshToken,s.clientId);let i=await p();return i?.accessToken&&!IA(i.expiresAt)?{ok:!0,accessToken:i.accessToken}:{ok:!1,reason:"needs_design_login"}}
+return r=!0,{...h,claudeAiOauth:{...y,refreshToken:"",accessToken:"",expiresAt:0}}
 """
 
 
@@ -49,6 +55,14 @@ def test_designoauth_ownership_change_is_flagged(tmp_path):
     binary.write_bytes(GOOD.replace(b"delete e.designOauth,", b""))
     failures = _load().check_binary("v3", str(binary))
     assert len(failures) == 1 and "re-login deletes designOauth" in failures[0]
+
+
+def test_a_renamed_design_refresh_lock_is_flagged(tmp_path):
+    """cswap's switch holds that lock so a Design refresh cannot straddle it."""
+    binary = tmp_path / "claude"
+    binary.write_bytes(GOOD.replace(b'".design_oauth_refresh.lock"', b'".design_refresh.lock"'))
+    failures = _load().check_binary("v5", str(binary))
+    assert len(failures) == 1 and "Design refresh lock" in failures[0]
 
 
 def test_new_relogin_pruned_key_must_be_account_owned(tmp_path):

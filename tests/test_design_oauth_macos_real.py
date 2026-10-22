@@ -42,6 +42,7 @@ from tests.test_design_oauth_profiles import (  # noqa: F401
     TestSessionProfileKeychain,
     profile,
 )
+from tests.test_design_oauth_seamless import TestSeamlessMacOS  # noqa: F401
 
 pytestmark = [
     pytest.mark.no_keychain_fake,
