@@ -26,7 +26,12 @@ from claude_swap.credentials import (
     CredentialStore,
     is_login_less,
 )
-from claude_swap.exceptions import CredentialError, CredentialWriteError, SwitchError
+from claude_swap.exceptions import (
+    CredentialError,
+    CredentialReadError,
+    CredentialWriteError,
+    SwitchError,
+)
 from claude_swap.models import Platform
 
 from tests.claude_code_sim import FileStore, KeychainStore
@@ -56,6 +61,10 @@ MCP = {"server": {"refreshToken": "fake-mcp-rt"}}
 D4_NEW = {"accessToken": "fake-d4-new-at", "refreshToken": "fake-d4-new-rt",
           "expiresAt": 9000}
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+
+
+def _blob(credentials) -> dict:
+    return credentials if isinstance(credentials, dict) else json.loads(credentials)
 
 
 def _entry(path: Path, email: str) -> dict:
@@ -346,6 +355,23 @@ class KeyDesignScenarios:
         assert self.key_design(sw) == D4_NEW
         transfer.import_accounts(sw, str(slim), force=True)
         assert self.key_design(sw) == D4_NEW
+
+    def test_an_unreadable_copy_skips_only_itself_in_a_full_export(
+        self, sw, store, tmp_path, capsys
+    ):
+        sw._store.write_key_design(KEY_SLOT, KEY_EMAIL, D4)
+        full = tmp_path / "full.cswap"
+        unreadable = patch.object(
+            CredentialStore, "read_key_design", lambda self, n, e: (None, False)
+        )
+        with unreadable:
+            transfer.export_accounts(sw, str(full), full=True)
+            assert "designOauth" not in _entry(full, KEY_EMAIL)
+            assert _blob(_entry(full, _email("1"))["credentials"])["designOauth"] == D1
+            assert "could not be read" in capsys.readouterr().err
+            # Asked for that account by name: a failure, not a partial copy.
+            with pytest.raises(CredentialReadError):
+                transfer.export_accounts(sw, str(full), account=KEY_SLOT, full=True)
 
     # -- one-time migration --------------------------------------------------
 

@@ -277,7 +277,16 @@ def export_accounts(
             if full:
                 # The key's Design login is kept beside it, not in it; like
                 # an OAuth account's, only a full export carries it.
-                design = switcher.key_design_for_export(num, email, is_active)
+                try:
+                    design = switcher.key_design_for_export(num, email, is_active)
+                except CredentialReadError as exc:
+                    if explicit_account:
+                        raise
+                    _eprint(
+                        f"Warning: Account-{num} ({email})'s Claude Design "
+                        f"login could not be read ({exc}); exported without it"
+                    )
+                    design = None
                 if design is not None:
                     entry["designOauth"] = design
         if record.get("alias"):
