@@ -18,6 +18,7 @@ import pytest
 from claude_swap import macos_keychain, migrations
 from claude_swap import session as session_mod
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, design_fingerprint
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.session import SessionManager, keychain_service_name, session_dir_for
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -589,6 +590,48 @@ class MigrationScenarios:
         assert migrations.migrate_design_oauth_per_account(sw) is True
         assert _design(_backup(sw, "2")) == D1_OLD
 
+    def test_recorded_before_the_lock_is_released(self, sw, temp_home, monkeypatch):
+        # A process waiting for the lock re-checks the record as soon as it
+        # gets the lock: the record must already be there by then.
+        self._shared_era(sw, temp_home)
+        seen = []
+        real_release = FileLock.release
+
+        def release(lock):
+            seen.append(migrations.DESIGN_MIGRATION_ID in _applied(sw))
+            real_release(lock)
+
+        monkeypatch.setattr(FileLock, "release", release)
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+        assert seen and seen[-1] is True
+
+        monkeypatch.setattr(
+            migrations, "_assign_design_oauth",
+            lambda *a: pytest.fail("ran twice"),
+        )
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+
+    def test_not_run_from_a_session_shell(self, sw, temp_home, monkeypatch):
+        # Inside `cswap run` the env-following "live" store is the session
+        # profile: its (seeded) copy must not decide whose Design login it is.
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        before = {n: _backup(sw, n) for n in ("1", "2", "3", "4")}
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(p2))
+
+        assert migrations.migrate_design_oauth_per_account(sw) is False
+        migrations.run_migrations(sw)
+        assert migrations.DESIGN_MIGRATION_ID not in _applied(sw)
+        assert {n: _backup(sw, n) for n in ("1", "2", "3", "4")} == before
+
+        # From a normal shell it runs, and the default login's account owns it.
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        migrations.run_migrations(sw)
+        assert migrations.DESIGN_MIGRATION_ID in _applied(sw)
+        assert _design(_backup(sw, "1")) == D1
+        assert _design(_backup(sw, "2")) is None
+
     def test_version_bump_runs_it_again(self, sw, temp_home, monkeypatch):
         self._shared_era(sw, temp_home)
         migrations.run_migrations(sw)
@@ -820,6 +863,21 @@ class SessionFreshnessScenarios:
 
         assert _design(_backup(sw, "2")) is None
         assert not session_mod.foreign_design_marker_for(session_dir).exists()
+
+    def test_reseed_never_carries_a_drifted_profiles_design(self, sw, temp_home):
+        # In-session /login as another account, then /design-login: the
+        # profile's Design login is that other account's.
+        session_dir = self._setup(sw, temp_home, backup_design=None,
+                                  profile_design=D3)
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "someone@else.com", "accountUuid": "z"}
+        }))
+
+        seed = json.loads(session_dir_creds(_bootstrap(sw, "2")))
+
+        assert "designOauth" not in seed
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert _design(_backup(sw, "2")) is None
 
     def test_backup_one_family_profile_another_is_compared_by_expiry(
         self, sw, temp_home

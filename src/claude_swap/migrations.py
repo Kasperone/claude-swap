@@ -762,10 +762,11 @@ def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
        the profile is next quiescent, so the migration itself still
        completes.
 
-    A one-shot: recorded under the versioned id ``DESIGN_MIGRATION_ID`` once
-    it has run, and re-checked under the lock so concurrent processes run it
-    once. Only an unreadable store or a busy lock (nothing decided yet)
-    leaves it for a later run. Idempotent either way.
+    A one-shot: recorded under the versioned id ``DESIGN_MIGRATION_ID``
+    before the lock is released, and re-checked under the lock, so
+    concurrent processes run it once. Only an unreadable store, a busy lock
+    or a ``cswap run`` session shell (nothing decided yet) leaves it for a
+    later run. Idempotent either way.
     """
     from claude_swap.exceptions import LockError
     from claude_swap.locking import FileLock
@@ -777,6 +778,11 @@ def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
         return False
     if not data.get("accounts", {}):
         return True
+    if switcher._in_session_shell():
+        # Inside `cswap run` the env-following live store and identity are
+        # the session profile's, not the default login's: its copy may be
+        # one the old shared rule seeded there. Left for a normal shell.
+        return False
 
     tag = DESIGN_MIGRATION_ID
     try:
@@ -785,6 +791,15 @@ def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
                 return True  # another process ran it while we waited
             data = switcher._get_sequence_data() or data
             changed, unreadable = _assign_design_oauth(switcher, data)
+            if not unreadable:
+                # Recorded before the lock goes: a process waiting for it
+                # re-checks the record as soon as it gets the lock.
+                try:
+                    _mark_applied(switcher, DESIGN_MIGRATION_ID)
+                except OSError as e:
+                    switcher._logger.warning(
+                        f"{tag}: ran but recording it failed: {e}"
+                    )
     except LockError as e:
         raise MigrationIncomplete(f"{tag}: cswap is busy ({e})") from e
 

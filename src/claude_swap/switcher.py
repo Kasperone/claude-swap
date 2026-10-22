@@ -6821,6 +6821,19 @@ class ClaudeAccountSwitcher:
             f"Re-add with: cswap --add-account --slot {account_num}"
         )
 
+    def _in_session_shell(self) -> bool:
+        """Whether ``CLAUDE_CONFIG_DIR`` points inside a ``cswap run`` profile."""
+        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not cfg_dir:
+            return False
+        try:
+            Path(cfg_dir).resolve().relative_to(
+                (self.backup_dir / "sessions").resolve()
+            )
+        except ValueError:
+            return False
+        return True
+
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
 
@@ -6836,14 +6849,7 @@ class ClaudeAccountSwitcher:
         `remove_account` deleting the session profile of the very shell it
         was running in. Nine call sites is the honest cost of that.
         """
-        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if not cfg_dir:
-            return
-        try:
-            Path(cfg_dir).resolve().relative_to(
-                (self.backup_dir / "sessions").resolve()
-            )
-        except ValueError:
+        if not self._in_session_shell():
             return
         raise SwitchError(
             "This shell is inside a cswap run session profile "

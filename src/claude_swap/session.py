@@ -1079,8 +1079,14 @@ class SessionManager:
         """Seed the session profile from backup storage. Caller holds the lock."""
         # The profile's own Claude Design login (designOauth) lives in the
         # profile's store and may be newer than the backup's: read it before
-        # the delete below removes the hashed item.
-        profile_design = _profile_design_oauth(session_dir)
+        # the delete below removes the hashed item. Not from a profile an
+        # in-session /login re-pointed at another account: its Design login
+        # is that account's.
+        profile_design = (
+            None
+            if session_identity_drifted(session_dir, email, org_uuid)
+            else _profile_design_oauth(session_dir)
+        )
 
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
