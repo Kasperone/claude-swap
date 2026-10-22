@@ -109,9 +109,14 @@ def entry_present(services: list[str]) -> bool | None:
         return None
 
 
-def _flag_config_path() -> Path:
-    """The global config Claude Code reads the cached flag from."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+def _flag_config_path(config_dir: str | Path | None = None) -> Path:
+    """The global config Claude Code reads the cached flag from.
+
+    For the profile named by ``config_dir`` (a ``cswap run`` session), else
+    the one ``CLAUDE_CONFIG_DIR`` names.
+    """
+    if config_dir is None:
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     home = Path(config_dir) if config_dir else Path.home() / ".claude"
     legacy = home / ".config.json"
     try:
@@ -122,13 +127,13 @@ def _flag_config_path() -> Path:
     return (Path(config_dir) if config_dir else Path.home()) / ".claude.json"
 
 
-def _cached_flag() -> bool | None:
+def _cached_flag(config_dir: str | Path | None = None) -> bool | None:
     """The cached ``tengu_windows_credman`` value; ``None`` when unreadable.
 
     A config that reads but does not parse counts as "off", as in Claude
     Code, whose lookup falls back to the plaintext store on any parse error.
     """
-    path = _flag_config_path()
+    path = _flag_config_path(config_dir)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -145,8 +150,13 @@ def _cached_flag() -> bool | None:
     return isinstance(features, dict) and features.get(FEATURE_FLAG) is True
 
 
-def detect(services: list[str]) -> CredmanMode | None:
+def detect(
+    services: list[str], config_dir: str | Path | None = None
+) -> CredmanMode | None:
     """Claude Code's Credential Manager mode for the active profile.
+
+    ``config_dir`` names another profile to check (its config and, through
+    ``services``, its entry) instead of the one ``CLAUDE_CONFIG_DIR`` names.
 
     ACTIVE when the env var or the cached flag opts in; AMBIGUOUS when the
     config exists but cannot be read, or an entry exists for this profile without an
@@ -155,15 +165,15 @@ def detect(services: list[str]) -> CredmanMode | None:
     """
     if os.environ.get(FORCE_ENV) == "1":
         return CredmanMode(ACTIVE, f"{FORCE_ENV}=1 is set")
-    flag = _cached_flag()
+    flag = _cached_flag(config_dir)
     if flag:
         return CredmanMode(
-            ACTIVE, f"{FEATURE_FLAG} is enabled in {_flag_config_path()}"
+            ACTIVE, f"{FEATURE_FLAG} is enabled in {_flag_config_path(config_dir)}"
         )
     if flag is None:
         return CredmanMode(
             AMBIGUOUS,
-            f"{_flag_config_path()} could not be read, so whether "
+            f"{_flag_config_path(config_dir)} could not be read, so whether "
             f"{FEATURE_FLAG} is enabled is unknown",
         )
     if entry_present(services):

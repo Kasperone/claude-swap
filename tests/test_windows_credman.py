@@ -21,7 +21,7 @@ import pytest
 
 from claude_swap import windows_credman
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
-from claude_swap.exceptions import SwitchError
+from claude_swap.exceptions import SessionError, SwitchError
 from claude_swap.models import Platform
 from claude_swap.session import keychain_service_name
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -244,6 +244,85 @@ class TestSwitchOnWindows:
         assert json.loads(windows.read_text())["designOauth"] == DESIGN_2
 
 
+class _Launched(Exception):
+    pass
+
+
+@pytest.fixture
+def run_session(windows, monkeypatch):
+    """``cswap run 2`` on Windows up to the session setup (never execs)."""
+    from claude_swap import session as session_mod
+
+    sw = _switcher(Platform.WINDOWS)
+    monkeypatch.setattr(session_mod.shutil, "which", lambda name: "claude")
+
+    def setup(self, *a, **kw):
+        raise _Launched()
+
+    monkeypatch.setattr(session_mod.SessionManager, "setup_session", setup)
+    profile = session_mod.session_dir_for(sw.backup_dir, "2", "2@x.com")
+    return sw, session_mod.SessionManager(sw), profile
+
+
+class TestSessionOnWindows:
+    """`cswap run` refuses in Credential Manager mode: the session's login
+    would move out of the profile file cswap seeds and captures."""
+
+    def test_not_detected_runs(self, run_session):
+        _sw, manager, _profile = run_session
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+
+    def test_env_opt_in_refuses(self, run_session, monkeypatch):
+        _sw, manager, profile = run_session
+        monkeypatch.setenv("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN", "1")
+        with pytest.raises(SessionError) as exc:
+            manager.run("2", [])
+        assert "is using Windows Credential Manager" in str(exc.value)
+        assert "CSWAP_IGNORE_CREDMAN=1" in str(exc.value)
+        assert not profile.exists()
+
+    def test_default_profile_flag_refuses(self, run_session, temp_home):
+        _sw, manager, _profile = run_session
+        _enable_flag(temp_home)
+        with pytest.raises(SessionError, match="tengu_windows_credman"):
+            manager.run("2", [])
+
+    def test_session_profile_flag_refuses(self, run_session):
+        _sw, manager, profile = run_session
+        profile.mkdir(parents=True)
+        _flag(profile / ".claude.json", True)
+        with pytest.raises(SessionError, match="tengu_windows_credman"):
+            manager.run("2", [])
+
+    def test_session_profile_entry_refuses(self, run_session, monkeypatch):
+        _sw, manager, profile = run_session
+        _targets(monkeypatch, f"{keychain_service_name(str(profile))}/user")
+        with pytest.raises(SessionError, match="may be using Windows Credential Manager"):
+            manager.run("2", [])
+
+    def test_default_profile_entry_alone_runs(self, run_session, monkeypatch):
+        # A default-profile entry says nothing about the session's own store.
+        _sw, manager, _profile = run_session
+        _targets(monkeypatch, f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/user")
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+
+    def test_override_runs(self, run_session, monkeypatch):
+        sw, manager, _profile = run_session
+        monkeypatch.setenv("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN", "1")
+        sw.ignore_credman = True
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+
+    def test_other_platforms_unaffected(self, run_session, monkeypatch):
+        sw, manager, _profile = run_session
+        monkeypatch.setenv("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN", "1")
+        sw.platform = Platform.LINUX
+        with pytest.raises(_Launched):
+            manager.run("2", [])
+
+
 class TestOtherPlatformsUnaffected:
     @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS, Platform.WSL])
     def test_guard_is_a_no_op(self, temp_home, monkeypatch, platform):
@@ -375,3 +454,17 @@ class TestRealCredentialManager:
 
         assert windows.read_text() == LIVE
         assert REAL_ENUMERATE(f"{CLAUDE_CODE_KEYCHAIN_SERVICE}/*") == [target]
+
+    def test_run_refuses_on_a_real_profile_entry(self, entry, run_session, monkeypatch):
+        """A real entry for the session profile's own service makes `cswap
+        run` refuse before the profile is created; the entry is untouched."""
+        monkeypatch.setattr(windows_credman, "_enumerate_targets", REAL_ENUMERATE)
+        _sw, manager, profile = run_session
+        target = f"{keychain_service_name(str(profile))}/cswap-ci-{uuid.uuid4().hex[:8]}"
+        entry(target)
+
+        with pytest.raises(SessionError, match="may be using Windows Credential Manager"):
+            manager.run("2", [])
+
+        assert not profile.exists()
+        assert REAL_ENUMERATE(f"{keychain_service_name(str(profile))}/*") == [target]

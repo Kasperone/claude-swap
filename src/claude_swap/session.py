@@ -48,7 +48,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, windows_credman
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.credentials import (
     design_fingerprint,
@@ -331,6 +331,26 @@ def clear_foreign_design(session_dir: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def move_profile_markers(src_dir: Path, dst_dir: Path) -> None:
+    """Move a profile's sibling markers along with its renamed directory.
+
+    The stale and foreign-Design markers are named after the directory, so a
+    profile moved to another slot key would otherwise lose them — and a
+    foreign Design login would then read as the moved account's own. Any
+    marker already at the destination name belonged to a profile that is no
+    longer there and goes.
+    """
+    for marker_for in (stale_marker_for, foreign_design_marker_for):
+        src, dst = marker_for(src_dir), marker_for(dst_dir)
+        try:
+            if src.exists():
+                os.replace(src, dst)
+            else:
+                dst.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort, like the directory move itself
 
 
 def own_design_oauth(session_dir: Path, design: dict | None) -> dict | None:
@@ -823,6 +843,10 @@ class SessionManager:
                 "make the session use another profile's credential store."
             )
 
+        self._refuse_windows_credman(
+            session_dir_for(self.switcher.backup_dir, account_num, email)
+        )
+
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
@@ -832,6 +856,40 @@ class SessionManager:
             f"{muted('[session mode]')}"
         )
         self._exec(claude_bin, claude_args, env=_session_env(session_dir))
+
+    def _refuse_windows_credman(self, session_dir: Path) -> None:
+        """Refuse a session while Claude Code may use Windows Credential Manager.
+
+        In that mode Claude Code moves the session's login out of the seeded
+        ``.credentials.json`` into Credential Manager on its first refresh.
+        cswap then no longer sees the rotated token: the slot's backup keeps
+        the spent generation (a later switch to it fails) and a re-seed has no
+        effect. Checked: the opt-in env var, the cached flag of the default
+        profile (a rollout reaches every profile) and of the session profile,
+        and an entry for the profile's own service. Presence only, as for the
+        switch (see :mod:`windows_credman`). No-op off Windows and with
+        ``ignore_credman`` (``CSWAP_IGNORE_CREDMAN=1``).
+        """
+        if self.switcher.platform != Platform.WINDOWS or self.switcher.ignore_credman:
+            return
+        mode = windows_credman.detect([]) or windows_credman.detect(
+            [keychain_service_name(str(session_dir))], config_dir=session_dir
+        )
+        if mode is None:
+            return
+        lead = (
+            "Claude Code is using Windows Credential Manager"
+            if mode.state == windows_credman.ACTIVE
+            else "Claude Code may be using Windows Credential Manager"
+        )
+        raise SessionError(
+            f"{lead} ({mode.reason}). A session would move its login there, "
+            "out of the profile file cswap seeds and captures, so the account's "
+            "stored backup would fall behind the session's refreshed token. "
+            "cswap does not support Credential Manager and leaves it untouched. "
+            f"To run anyway (e.g. after turning the mode off), set "
+            f"{windows_credman.IGNORE_ENV}=1."
+        )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

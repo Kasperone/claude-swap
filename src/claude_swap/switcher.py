@@ -1365,15 +1365,21 @@ class ClaudeAccountSwitcher:
         new_a = self._session_dir(num_b, email_a)  # account A's new home
         new_b = self._session_dir(num_a, email_b)  # account B's new home
 
+        from claude_swap.session import move_profile_markers
+
+        # Each move takes the profile's sibling markers along.
         staging = None
         try:
             if dir_a.exists():
                 staging = dir_a.with_name(dir_a.name + ".swapping")
                 os.replace(dir_a, staging)
+                move_profile_markers(dir_a, staging)
             if dir_b.exists() and not new_b.exists():
                 os.replace(dir_b, new_b)
+                move_profile_markers(dir_b, new_b)
             if staging is not None and not new_a.exists():
                 os.replace(staging, new_a)
+                move_profile_markers(staging, new_a)
                 staging = None
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
@@ -1383,6 +1389,7 @@ class ClaudeAccountSwitcher:
                 try:
                     if not dir_a.exists():
                         os.replace(staging, dir_a)
+                        move_profile_markers(staging, dir_a)
                 except OSError:
                     pass
 
@@ -1591,6 +1598,8 @@ class ClaudeAccountSwitcher:
         creds = self._read_backup_or_abort(num_src, email)
         config = self._read_account_config(num_src, email)
 
+        from claude_swap.session import move_profile_markers
+
         src_dir = self._session_dir(num_src, email)
         dst_dir = self._session_dir(target, email)
         try:
@@ -1602,6 +1611,7 @@ class ClaudeAccountSwitcher:
             if src_dir.exists() and not dst_dir.exists():
                 try:
                     os.replace(src_dir, dst_dir)
+                    move_profile_markers(src_dir, dst_dir)
                 except OSError as e:
                     self._logger.warning(
                         f"Session profile move skipped during move: {e}"
@@ -2235,7 +2245,11 @@ class ClaudeAccountSwitcher:
                             # The profile holds the newer generation: the
                             # backup rt is already consumed. Resync so the
                             # slot's stored credential is the live lineage,
-                            # then consume THAT.
+                            # then consume THAT — with this account's own,
+                            # later Design login (see _with_kept_design).
+                            profile = self._with_kept_design(
+                                sdir, profile, refresh_input
+                            )
                             self._write_account_credentials(
                                 account_num, email, profile
                             )
@@ -2376,8 +2390,15 @@ class ClaudeAccountSwitcher:
                         )
                         outcome_creds = store_now
                     else:
+                        # Same login lineage. The refresh changed only the
+                        # login; a Design login written meanwhile under the
+                        # lock (session adoption, the per-account
+                        # migration) is the store's and stays.
+                        outcome_creds = with_design_oauth(
+                            result.credentials, design_oauth_of(store_now)
+                        )
                         self._write_account_credentials(
-                            account_num, email, result.credentials
+                            account_num, email, outcome_creds
                         )
             except LockError:
                 # The grant IS consumed — the successor must survive even
@@ -2917,7 +2938,6 @@ class ClaudeAccountSwitcher:
           backup's generation still answers False with its identity gone.
         """
         from claude_swap.session import (
-            own_design_oauth,
             profile_is_quiescent,
             read_session_identity,
             settle_foreign_design,
@@ -2940,19 +2960,35 @@ class ClaudeAccountSwitcher:
             # The profile's head may predate a Design login the backup got
             # from the default store; keep the later generation of the two.
             backup = self._store._read_account_credentials(account_num, email)
-            profile = with_design_oauth(
-                profile,
-                newer_design_oauth(
-                    own_design_oauth(session_dir, design_oauth_of(profile)),
-                    design_oauth_of(backup),
-                ),
-            )
+            profile = self._with_kept_design(session_dir, profile, backup)
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
             "into its backup"
         )
         return True
+
+    @staticmethod
+    def _with_kept_design(
+        session_dir: Path, profile: str, backup: str | None
+    ) -> str:
+        """A session profile's credential as it may be written into its backup.
+
+        Its Design login counts only when it is this account's own (not
+        listed by the profile's foreign-Design marker), and the later
+        generation of it and the backup's is kept (the profile's on a tie),
+        so the write never brings in another account's copy or replaces a
+        newer one with an older one.
+        """
+        from claude_swap.session import own_design_oauth
+
+        return with_design_oauth(
+            profile,
+            newer_design_oauth(
+                own_design_oauth(session_dir, design_oauth_of(profile)),
+                design_oauth_of(backup),
+            ),
+        )
 
     def _adopt_session_design(
         self, account_num: str, email: str, org_uuid: str

@@ -632,6 +632,40 @@ class MigrationScenarios:
         assert _design(_backup(sw, "1")) == D1
         assert _design(_backup(sw, "2")) is None
 
+    def _marked_profile_of_2(self, sw, temp_home, monkeypatch) -> Path:
+        """Account 2's profile holds account 1's copy, marked by a migration
+        that ran while it was live; the session has exited since."""
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+        migrations.migrate_design_oauth_per_account(sw)
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: True)
+        assert session_mod.foreign_design_fingerprints(p2)
+        return p2
+
+    def test_moved_profile_keeps_its_foreign_mark(self, sw, temp_home, monkeypatch):
+        self._marked_profile_of_2(sw, temp_home, monkeypatch)
+
+        sw.move_account("2", "6")
+
+        assert _design(sw._read_account_credentials("6", _email("2"))) is None
+        moved = session_dir_for(sw.backup_dir, "6", _email("2"))
+        assert session_mod._profile_design_oauth(moved) is None
+        sw._adopt_session_credential("6", _email("2"), "")
+        assert _design(sw._read_account_credentials("6", _email("2"))) is None
+
+    def test_swapped_profile_keeps_its_foreign_mark(self, sw, temp_home, monkeypatch):
+        self._marked_profile_of_2(sw, temp_home, monkeypatch)
+
+        sw.swap_accounts("2", "3")
+
+        # Account 2 now lives in slot 3, account 3 (with its own D3) in slot 2.
+        assert _design(sw._read_account_credentials("3", _email("2"))) is None
+        assert _design(sw._read_account_credentials("2", _email("3"))) == D3
+        sw._adopt_session_credential("3", _email("2"), "")
+        assert _design(sw._read_account_credentials("3", _email("2"))) is None
+
     def test_version_bump_runs_it_again(self, sw, temp_home, monkeypatch):
         self._shared_era(sw, temp_home)
         migrations.run_migrations(sw)
@@ -878,6 +912,75 @@ class SessionFreshnessScenarios:
         assert "designOauth" not in seed
         sw._adopt_session_credential("2", _email("2"), "")
         assert _design(_backup(sw, "2")) is None
+
+    def _rotate_profile_login(self, session_dir: Path, design: dict | None) -> None:
+        """The session refreshed its login (a newer generation than the
+        backup's), holding ``design``."""
+        blob = json.loads(_login("2", design, expires=9000))
+        blob["claudeAiOauth"]["refreshToken"] = "fake-login-2-rt-next"
+        blob["claudeAiOauth"]["accessToken"] = "fake-login-2-at-next"
+        self.profile_write(session_dir, json.dumps(blob))
+
+    @staticmethod
+    def _refresh(creds: str, **_kw):
+        from claude_swap import oauth
+
+        blob = json.loads(creds)
+        blob["claudeAiOauth"] = {
+            "accessToken": "fake-login-2-at-posted",
+            "refreshToken": "fake-login-2-rt-posted",
+            "expiresAt": 99000,
+        }
+        return oauth.RefreshOutcome(json.dumps(blob), None)
+
+    def test_gate_resync_keeps_the_newer_backup_design(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home, backup_design=D2_NEWER,
+                                  profile_design=D2_OLDER)
+        self._rotate_profile_login(session_dir, D2_OLDER)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh):
+            result = sw.consume_backup_grant("2", _email("2"), _backup(sw, "2"))
+
+        stored = json.loads(_backup(sw, "2"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "fake-login-2-rt-posted"
+        assert stored["designOauth"] == D2_NEWER
+        assert _design(result.credentials) == D2_NEWER
+
+    def test_gate_resync_never_takes_a_marked_foreign_copy(self, sw, temp_home):
+        session_dir = self._setup(sw, temp_home, backup_design=None,
+                                  profile_design=D1)
+        session_mod.mark_foreign_design(session_dir, design_fingerprint(D1))
+        self._rotate_profile_login(session_dir, D1)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh):
+            sw.consume_backup_grant("2", _email("2"), _backup(sw, "2"))
+
+        stored = json.loads(_backup(sw, "2"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "fake-login-2-rt-posted"
+        assert "designOauth" not in stored
+
+    def test_gate_persist_keeps_a_design_written_during_the_post(self, sw, temp_home):
+        _roster(sw, temp_home, {"1": _login("1", D1), "2": _login("2", D2)},
+                active="1")
+
+        def refresh(creds, **kw):
+            # e.g. a session adoption in another process, under the lock,
+            # while this POST is in flight: same login, newer Design login.
+            sw._store._write_account_credentials(
+                "2", _email("2"), _login("2", D2_NEWER)
+            )
+            return self._refresh(creds)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=refresh):
+            result = sw.consume_backup_grant("2", _email("2"), _backup(sw, "2"))
+
+        stored = json.loads(_backup(sw, "2"))
+        assert stored["claudeAiOauth"]["refreshToken"] == "fake-login-2-rt-posted"
+        assert stored["designOauth"] == D2_NEWER
+        assert _design(result.credentials) == D2_NEWER
 
     def test_backup_one_family_profile_another_is_compared_by_expiry(
         self, sw, temp_home
