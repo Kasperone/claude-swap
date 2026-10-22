@@ -25,6 +25,8 @@ let a=await yl(H(o,".storage-write"),{realpath:!1,retries:{retries:10,minTimeout
 e.invalidateCache?.();let o=await(e.readAsyncStrict?.(n,{}));
 let u=await NHn(k,{onlyIf:(i)=>i?.refreshToken===c});if(u.raced){await sb(e.refreshToken,s.clientId);let i=await p();return i?.accessToken&&!IA(i.expiresAt)?{ok:!0,accessToken:i.accessToken}:{ok:!1,reason:"needs_design_login"}}
 return r=!0,{...h,claudeAiOauth:{...y,refreshToken:"",accessToken:"",expiresAt:0}}
+if(n?.accessToken&&n.refreshToken)return{ok:!0,accessToken:n.accessToken,bearer:"design_scoped_login"};let s=await zdo(e);if(s.ok)return{ok:!0,accessToken:s.accessToken,bearer:"design_credential"}
+await Kn().mutate((n)=>{if(!n.designOauth)return n;if(!r(n.designOauth))return n;let o={...n};return delete o.designOauth,o})
 """
 
 
@@ -55,6 +57,20 @@ def test_designoauth_ownership_change_is_flagged(tmp_path):
     binary.write_bytes(GOOD.replace(b"delete e.designOauth,", b""))
     failures = _load().check_binary("v3", str(binary))
     assert len(failures) == 1 and "re-login deletes designOauth" in failures[0]
+
+
+def test_a_changed_api_key_design_path_is_flagged(tmp_path):
+    """cswap keeps an API key's /design-login beside the key because Claude
+    Code falls back to it without a design-scoped login, and reads the {}
+    its Design clear can leave as login-less."""
+    binary = tmp_path / "claude"
+    for old, name in (
+        (b'bearer:"design_credential"', "Design falls back to the /design-login"),
+        (b"return delete o.designOauth,o", "Design clear deletes only designOauth"),
+    ):
+        binary.write_bytes(GOOD.replace(old, b"x"))
+        failures = _load().check_binary("v6", str(binary))
+        assert len(failures) == 1 and name in failures[0], failures
 
 
 def test_a_renamed_design_refresh_lock_is_flagged(tmp_path):

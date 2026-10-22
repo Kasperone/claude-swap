@@ -323,11 +323,13 @@ def is_login_less(credentials: str | None) -> bool:
     What Claude Code writes into the active store while a managed API key is
     active: an MCP server authorised then (``mcpOAuth``), or a ``/design-login``
     (``designOauth``). Not a credential: the active reader prefers a managed
-    key over it, and capture never takes it for an account's login.
+    key over it, and capture never takes it for an account's login. An empty
+    object counts too: it is what such a blob becomes once Claude Code clears
+    its last field (a rejected Design login), and it must not shadow the key.
     """
     data = _credential_object(credentials)
     return (
-        bool(data)
+        data is not None
         and "claudeAiOauth" not in data
         and set(data) <= _LOGIN_LESS_KEYS
     )
@@ -376,7 +378,8 @@ def with_design_oauth(target_credentials: str, design: dict | None) -> str:
     """Set (or, with ``None``, remove) a Claude login's ``designOauth``.
 
     The rest of the blob passes verbatim. Unchanged when the target is not a
-    Claude login: API-key slots own no Design login.
+    Claude login: an API-key slot keeps its Design login beside the key
+    (:meth:`CredentialStore.read_key_design`), never in it.
     """
     target = _credential_object(target_credentials)
     if target is None or "claudeAiOauth" not in target:
@@ -387,6 +390,18 @@ def with_design_oauth(target_credentials: str, design: dict | None) -> str:
         target.pop("designOauth")
         return json.dumps(target)
     return json.dumps({**target, "designOauth": design})
+
+
+def login_less_blob(shared_fields: dict | None, design: dict | None) -> str | None:
+    """The blob an API-key slot leaves in the OAuth store next to its key.
+
+    Its own Design login and the machine's shared fields, as Claude Code
+    itself keeps them while a key is active (``is_login_less``). ``None``
+    when the slot has no Design login: the store is then cleared, as before.
+    """
+    if design is None:
+        return None
+    return json.dumps({**(shared_fields or {}), "designOauth": design})
 
 
 def approved_form(api_key: str) -> str:
@@ -955,7 +970,9 @@ class CredentialStore:
                 return service
         return services[0]
 
-    def _write_credentials(self, credentials: str) -> None:
+    def _write_credentials(
+        self, credentials: str, login_less: str | None = None
+    ) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
 
         Detects the kind from the payload (raw ``sk-ant-…`` key vs OAuth JSON) and
@@ -967,25 +984,30 @@ class CredentialStore:
           ``approved`` left intact, as ``removeApiKey`` does).
         - **API key** → record ``key[-20:]`` in ``approved`` and store the key (macOS
           Keychain "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``),
-          then clear the OAuth credential (Keychain item + ``.credentials.json``).
+          then clear the OAuth credential (Keychain item + ``.credentials.json``),
+          or replace it with ``login_less`` (see :func:`login_less_blob`).
 
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
         if looks_like_api_key(credentials):
-            self._write_managed_credentials(credentials.strip())
+            self._write_managed_credentials(credentials.strip(), login_less)
         else:
             self._write_oauth_credentials(credentials)
             self._clear_managed_key()
 
-    def _write_managed_credentials(self, api_key: str) -> None:
+    def _write_managed_credentials(
+        self, api_key: str, login_less: str | None = None
+    ) -> None:
         """Activate a managed API key, then clear OAuth (mutual exclusion).
 
         Always records ``key[-20:]`` in ``customApiKeyResponses.approved`` (Claude
         Code does this on every platform, even on Keychain success — otherwise it
         re-prompts to approve the key). Stores the key in the macOS Keychain when
         usable, else ``~/.claude.json`` ``primaryApiKey`` (matching ``saveApiKey``'s
-        keychain-then-config fallback). Finally clears the OAuth credential.
+        keychain-then-config fallback). Finally clears the OAuth credential, or,
+        given the key slot's ``login_less`` blob (its Design login), writes that
+        over it: the outgoing login goes either way.
 
         Raises:
             CredentialWriteError: If persisting the key fails.
@@ -1035,7 +1057,10 @@ class CredentialStore:
             raise CredentialWriteError(f"Failed to write managed API key: {e}")
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
-        self._clear_oauth_credential()
+        # A login-less blob cannot shadow it (the active read holds one back),
+        # so the key slot's own Design login is written in its place.
+        if not self._write_login_less(login_less):
+            self._clear_oauth_credential()
         if self._host.platform == Platform.MACOS and not wrote_to_keychain:
             # Same stale-Keychain resurrection guard as the OAuth path: the key
             # fell back to plaintext ``primaryApiKey`` while a stale "Claude Code"
@@ -1100,6 +1125,25 @@ class CredentialStore:
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
 
+    def _write_login_less(self, login_less: str | None) -> bool:
+        """Put an API-key slot's login-less blob into the OAuth store.
+
+        Returns whether it landed. ``None`` (no Design login) and a failed
+        write answer False and the caller clears the store as before: the
+        Design login is still in the slot's sidecar, so a failure only
+        defers it to the next activation.
+        """
+        if login_less is None or not is_login_less(login_less):
+            return False
+        try:
+            self._write_oauth_credentials(login_less)
+        except CredentialWriteError as e:
+            self._host._logger.warning(
+                f"Could not keep the API key's Design login in the store: {e}"
+            )
+            return False
+        return True
+
     def _clear_oauth_credential(self) -> None:
         """Clear the active OAuth credential — Keychain item and plaintext file.
 
@@ -1109,7 +1153,8 @@ class CredentialStore:
 
         The outgoing account's ``designOauth`` goes with its login: it is
         account-owned and already in that account's backup (captured before
-        the activation), and API-key slots own none.
+        the activation). An API-key slot's own is written back separately
+        (:meth:`_write_login_less`).
         """
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
@@ -1130,16 +1175,45 @@ class CredentialStore:
         Account-owned fields in it (a ``designOauth`` from ``/design-login``
         while the key was active) are not shared and do not cross over.
         """
+        blob = self.live_login_less()
+        return None if blob is None else shared_credential_fields(blob)
+
+    def strip_key_live_design(self, fingerprint: str) -> bool:
+        """Remove one Design login from the store next to an active API key.
+
+        Only when the store holds a login-less blob whose ``designOauth`` is
+        of family ``fingerprint``; its other fields stay (an emptied store is
+        removed). The caller holds Claude Code's store locks. Returns whether
+        it was removed.
+        """
+        blob = self.live_login_less()
+        design = design_oauth_of(blob)
+        if design is None or design_fingerprint(design) != fingerprint:
+            return False
+        rest = {k: v for k, v in json.loads(blob).items() if k != "designOauth"}
+        if rest:
+            self._write_oauth_credentials(json.dumps(rest))
+        else:
+            self._clear_oauth_credential()
+        return True
+
+    def live_login_less(self) -> str | None:
+        """The active store's login-less blob, verbatim, or ``None``.
+
+        Read like :meth:`residual_shared_fields` (the item, then the file).
+        A switch away from an API key snapshots it, so a rollback puts the
+        key back together with what Claude Code kept next to it.
+        """
         if self._use_keychain():
             value, _failed = self._read_active_oauth_keychain()
             if is_login_less(value):
-                return shared_credential_fields(value)
+                return value
         cred_file = get_credentials_path()
         try:
             text = cred_file.read_text(encoding="utf-8") if cred_file.exists() else None
         except OSError:
             return None
-        return shared_credential_fields(text) if is_login_less(text) else None
+        return text if is_login_less(text) else None
 
     def live_design_oauth(self) -> tuple[dict | None, bool]:
         """The active store's ``designOauth`` and whether the store was readable.
@@ -1180,6 +1254,39 @@ class CredentialStore:
                     )
                 except macos_keychain.KEYCHAIN_ERRORS:
                     return None, False
+                if value:
+                    return design_oauth_of(value), True
+        cred_file = get_credentials_path()
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, True
+        except (OSError, ValueError):
+            return None, False
+        return design_oauth_of(text), True
+
+    def peek_key_live_design(self) -> tuple[dict | None, bool]:
+        """The store's Design login while a managed key is active, for capture.
+
+        Claude Code's own read order, whatever cswap's routing says: on macOS
+        the item first (directly, never through ``_kc_call``, with the bounded
+        retry of the active read), then the plaintext file, which Claude Code
+        also falls back to when the item cannot be read. A failed active read
+        earlier in the switch has moved cswap's routing to the file, but the
+        item may still hold the key's Design login, and the activation that
+        follows deletes it. ``(None, False)`` only when the file is unreadable.
+        """
+        if self._host.platform == Platform.MACOS:
+            account = macos_keychain.keychain_account_name()
+            for service in _active_oauth_keychain_services():
+                value = None
+                for attempt in range(_ACTIVE_READ_ATTEMPTS):
+                    try:
+                        value = macos_keychain.get_password(service, account)
+                        break
+                    except macos_keychain.KEYCHAIN_ERRORS:
+                        if attempt + 1 < _ACTIVE_READ_ATTEMPTS:
+                            time.sleep(_ACTIVE_READ_RETRY_DELAY)
                 if value:
                     return design_oauth_of(value), True
         cred_file = get_credentials_path()
@@ -1629,7 +1736,7 @@ class CredentialStore:
         Keychain delete is best-effort: if it's locked the item may linger as
         harmless unreferenced cruft (the slot is gone from sequence.json; a re-add
         overwrites it via ``-U``; purge sweeps it). Includes the legacy
-        ``account-None-{email}`` alias.
+        ``account-None-{email}`` alias, and an API-key slot's Design login.
         """
         nums = [account_num]
         if str(account_num) != "None":
@@ -1644,6 +1751,7 @@ class CredentialStore:
             if self._host.platform == Platform.MACOS:
                 self._delete_backup_keychain_quiet(num, email)
             self.delete_previous_backup(num, email)
+        self.delete_key_design(account_num, email)
 
     def delete_account_credentials_strict(
         self, account_num: str, email: str
@@ -1694,6 +1802,9 @@ class CredentialStore:
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit"
             )
+        # An API-key slot's Design login is the key's material too: one left
+        # under the key would be activated for whoever lands on it next.
+        self.delete_key_design(account_num, email, strict=True)
 
     def delete_previous_backup(self, account_num: str, email: str) -> None:
         """Drop a slot key's retained ``.prev`` generation (both backends).
@@ -1828,6 +1939,125 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 self._host._logger.warning(f"Failed to read .prev from Keychain: {e}")
         return ""
+
+    # -- API-key slots' Design login ------------------------------------------
+    #
+    # An API-key slot's backup is the raw key, so its Design login (a
+    # ``/design-login`` made while the key was active) is kept beside it, keyed
+    # like the backup and routed the same way: the Keychain when it is in use,
+    # else a base64 ``.enc`` file, which wins on read. The ``design-`` prefix
+    # keeps the names apart from every backup and ``.prev`` name whatever the
+    # email. The content is ``{"designOauth": …}``.
+
+    def _key_design_path(self, account_num: str, email: str) -> Path:
+        return self._host.credentials_dir / f".design-{account_num}-{email}.enc"
+
+    def _key_design_username(self, account_num: str, email: str) -> str:
+        return f"design-{account_num}-{email}"
+
+    def read_key_design(
+        self, account_num: str, email: str
+    ) -> tuple[dict | None, bool]:
+        """An API-key slot's Design login, and whether it could be read.
+
+        ``(None, True)`` when it has none. The Keychain is read directly, not
+        through ``_kc_call``: callers read it right before writing Claude
+        Code's store, and a transient failure must not move that write to the
+        plaintext file. A corrupt file reads as absent there (the Keychain
+        copy, if any, is next), like a corrupt backup.
+        """
+        path = self._key_design_path(account_num, email)
+        try:
+            encoded = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            encoded = ""
+        except (OSError, ValueError) as e:
+            self._host._logger.warning(f"Failed to read a Design login file: {e}")
+            return None, False
+        if encoded:
+            try:
+                text = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except Exception as e:
+                self._host._logger.warning(f"Corrupt Design login file: {e}")
+            else:
+                design = design_oauth_of(text)
+                if design is not None:
+                    return design, True
+        if self._host.platform != Platform.MACOS:
+            return None, True
+        try:
+            value = macos_keychain.get_password(
+                SECURITY_SERVICE, self._key_design_username(account_num, email)
+            )
+        except macos_keychain.KEYCHAIN_ERRORS as e:
+            self._host._logger.warning(f"Failed to read a Design login item: {e}")
+            return None, False
+        return design_oauth_of(value), True
+
+    def write_key_design(
+        self, account_num: str, email: str, design: dict | None
+    ) -> None:
+        """Store an API-key slot's Design login (``None`` deletes it). Raises
+        on failure, so a caller about to replace the only live copy aborts."""
+        if design is None:
+            self.delete_key_design(account_num, email, strict=True)
+            return
+        payload = json.dumps({"designOauth": design})
+        path = self._key_design_path(account_num, email)
+        username = self._key_design_username(account_num, email)
+        if self._use_keychain():
+            try:
+                self._kc_call(
+                    macos_keychain.set_password, SECURITY_SERVICE, username, payload
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                self._host._logger.warning(
+                    f"Keychain write of a Design login failed, using a file: {e}"
+                )
+            else:
+                # .enc wins on read: a leftover file must not shadow the item.
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    self._atomic_b64_write(path, payload)
+                return
+        self._atomic_b64_write(path, payload)
+        if self._host.platform == Platform.MACOS:
+            try:
+                macos_keychain.delete_password(SECURITY_SERVICE, username)
+            except Exception as e:
+                self._host._logger.warning(
+                    f"Could not delete a superseded Design login item: {e}"
+                )
+
+    def delete_key_design(
+        self, account_num: str, email: str, *, strict: bool = False
+    ) -> None:
+        """Drop an API-key slot's Design login, from both backends.
+
+        Best effort unless ``strict``, which raises :class:`CredentialError`
+        when either backend could not be cleared (absence is success).
+        """
+        failures: list[str] = []
+        try:
+            self._key_design_path(account_num, email).unlink(missing_ok=True)
+        except OSError as e:
+            failures.append(str(e))
+        if self._host.platform == Platform.MACOS:
+            try:
+                macos_keychain.delete_password(
+                    SECURITY_SERVICE, self._key_design_username(account_num, email)
+                )
+            except Exception as e:
+                failures.append(str(e))
+        if failures:
+            message = (
+                f"Could not clear slot {account_num}'s stored Design login: "
+                + "; ".join(failures)
+            )
+            if strict:
+                raise CredentialError(message)
+            self._host._logger.warning(message)
 
     # -- internal safety copies (unclaimed credentials) ----------------------
     #

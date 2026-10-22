@@ -274,6 +274,12 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+            if full:
+                # The key's Design login is kept beside it, not in it; like
+                # an OAuth account's, only a full export carries it.
+                design = switcher.key_design_for_export(num, email, is_active)
+                if design is not None:
+                    entry["designOauth"] = design
         if record.get("alias"):
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
@@ -389,6 +395,7 @@ def import_accounts(
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        key_design = None
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
@@ -396,6 +403,11 @@ def import_accounts(
                     "(not an OAuth token)"
                 )
             creds_text = creds_obj.strip()
+            key_design = raw.get("designOauth")
+            if key_design is not None and not isinstance(key_design, dict):
+                raise TransferError(
+                    f"designOauth for {email} must be a JSON object"
+                )
         else:
             if not isinstance(creds_obj, dict):
                 raise TransferError(
@@ -437,6 +449,7 @@ def import_accounts(
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
+                "key_design": key_design,
             }
         )
 
@@ -539,6 +552,9 @@ def import_accounts(
             outcome = "imported"
 
         creds_text = entry["creds_text"]
+        was_api_key = (
+            data.get("accounts", {}).get(target_num, {}).get("kind") == "api_key"
+        )
         if outcome != "imported":
             # The slot's Design login is this account's and is not exported
             # by default (``_slim_credentials``); an export is also often
@@ -549,6 +565,11 @@ def import_accounts(
         switcher._write_account_credentials(target_num, entry["email"], creds_text)
         switcher._write_account_config(
             target_num, entry["email"], entry["config_text"]
+        )
+        switcher.import_key_design(
+            target_num, entry["email"], entry["key_design"],
+            was_api_key=was_api_key and outcome != "imported",
+            is_api_key=entry["kind"] == "api_key",
         )
         # Every successful import write introduces credential material whose
         # previous auth verdict is no longer authoritative, so lift any

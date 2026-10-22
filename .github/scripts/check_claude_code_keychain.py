@@ -82,6 +82,17 @@ CHECKS = {
     "invalid_grant wipe empties only the login's tokens":
         rb'\{\.\.\.\w+,claudeAiOauth:\{\.\.\.\w+,refreshToken:"",accessToken:"",'
         rb"expiresAt:0\}\}",
+    # API-key accounts: with no design-scoped claude.ai login (an API key is
+    # active) Design calls use the /design-login credential from the same
+    # store, which is why cswap keeps it with the key's slot.
+    "Design falls back to the /design-login credential without a design-scoped login":
+        rb'bearer:"design_scoped_login"\};let \w+=await \w+\(\w+\);if\(\w+\.ok\)'
+        rb'return\{ok:!0,accessToken:\w+\.accessToken,bearer:"design_credential"\}',
+    # Clearing a rejected Design login deletes only that key: a Design-only
+    # blob next to a key becomes {} (why cswap reads {} as login-less).
+    "Design clear deletes only designOauth from the blob":
+        rb"if\(!\w+\.designOauth\)return \w+;if\(!\w+\(\w+\.designOauth\)\)return \w+;"
+        rb"let \w+=\{\.\.\.\w+\};return delete \w+\.designOauth,\w+",
 }
 
 # win32 builds only (``claude.exe``): the plaintext file stays the store unless

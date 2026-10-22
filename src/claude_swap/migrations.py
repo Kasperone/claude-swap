@@ -850,11 +850,128 @@ def migrate_design_oauth_per_account(switcher: "ClaudeAccountSwitcher") -> bool:
     return True
 
 
+KEY_RESIDUE_MIGRATION_ID = "design_oauth_api_key_residue.v1"
+
+
+def _foreign_key_residue(
+    switcher: "ClaudeAccountSwitcher", data: dict
+) -> tuple[str | None, bool]:
+    """The fingerprint of a copied Design login next to an active API key.
+
+    ``(fp, True)`` when the live identity is an API-key slot and the live
+    store's Design login is the same generation as one an OAuth account's
+    backup or session profile holds; ``(None, True)`` when there is nothing
+    to remove; ``(None, False)`` when a holder could not be read.
+    """
+    from claude_swap.credentials import design_fingerprint, design_oauth_of
+    from claude_swap.session import read_profile_design
+
+    identity = switcher._get_current_account()
+    if identity is None:
+        return None, True
+    slot = switcher._find_account_slot(data, *identity)
+    if slot is None or switcher._account_kind(slot) != "api_key":
+        return None, True
+    live, readable = switcher._store.peek_key_live_design()
+    if not readable:
+        return None, False
+    fp = design_fingerprint(live)
+    if fp is None:
+        return None, True
+    for num, info in data.get("accounts", {}).items():
+        if switcher._account_kind(num) == "api_key":
+            continue
+        email = info.get("email", "")
+        creds, failed = switcher._read_account_credentials_ex(num, email)
+        if failed:
+            return None, False
+        if design_fingerprint(design_oauth_of(creds)) == fp:
+            return fp, True
+        session_dir = switcher._session_dir(num, email)
+        if session_dir.is_dir():
+            pdesign, profile_readable = read_profile_design(session_dir)
+            if not profile_readable:
+                return None, False
+            if design_fingerprint(pdesign) == fp:
+                return fp, True
+    return None, True
+
+
+def migrate_design_oauth_api_key_residue(switcher: "ClaudeAccountSwitcher") -> bool:
+    """Remove another account's Design login left next to an active API key.
+
+    An API-key slot keeps the Design login made while its key is active: the
+    next switch away captures it. Earlier versions of this fork could leave an
+    OAuth account's copy in that place (the machine-shared rule), and the
+    per-account migration never writes the live store, so such a copy would
+    then be filed under the key. When the live Design login is the same
+    generation (:func:`design_fingerprint`) as one an OAuth account's backup or
+    session profile holds, it is that account's: it is removed from the live
+    store under Claude Code's store locks (the holder keeps its identical
+    copy). Any other Design login there is the key's own.
+
+    A one-shot, recorded under ``KEY_RESIDUE_MIGRATION_ID``. An unreadable
+    holder, a busy lock or a store that changed under it leaves it for a
+    later run; nothing is decided on partial evidence.
+    """
+    from claude_swap.claude_locks import claude_store_locks
+    from claude_swap.exceptions import CredentialWriteError, LockError
+    from claude_swap.locking import FileLock
+
+    if not switcher.sequence_file.exists():
+        return False
+    data = switcher._get_sequence_data()
+    if data is None:
+        return False
+    if not data.get("accounts", {}):
+        return True
+    if switcher._in_session_shell():
+        return False  # the env-following store is the session's (see above)
+
+    tag = KEY_RESIDUE_MIGRATION_ID
+    try:
+        with FileLock(switcher.lock_file, timeout=_DESIGN_LOCK_TIMEOUT):
+            if tag in _load_applied(switcher):
+                return True
+            data = switcher._get_sequence_data() or data
+            fp, decided = _foreign_key_residue(switcher, data)
+            if not decided:
+                raise MigrationIncomplete(
+                    f"{tag}: a stored Design login could not be read"
+                )
+            if fp is not None:
+                with claude_store_locks(timeout=_DESIGN_LOCK_TIMEOUT):
+                    if not switcher._store.strip_key_live_design(fp):
+                        raise MigrationIncomplete(
+                            f"{tag}: the live store changed; will retry"
+                        )
+                switcher._logger.info(
+                    f"{tag}: removed Design login {fp} (another account's copy) "
+                    "from beside the active API key"
+                )
+            try:
+                _mark_applied(switcher, tag)
+            except OSError as e:
+                switcher._logger.warning(f"{tag}: ran but recording it failed: {e}")
+    except (LockError, OSError, CredentialWriteError) as e:
+        raise MigrationIncomplete(f"{tag}: {e}") from e
+    if fp is not None:
+        print(
+            "claude-swap: removed another account's Claude Design login from "
+            "beside the active API key (fingerprint in the log)",
+            file=sys.stderr,
+        )
+    return True
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
     (DESIGN_MIGRATION_ID, migrate_design_oauth_per_account),
+    # After the per-account migration: it gives an owner the live copy's
+    # newest generation first.
+    (KEY_RESIDUE_MIGRATION_ID, migrate_design_oauth_api_key_residue),
 ]
 
 
