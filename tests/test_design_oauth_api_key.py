@@ -242,6 +242,18 @@ class KeyDesignScenarios:
         assert store.read() == {"designOauth": D4_NEW}
         assert self.key_design(sw) == D4_NEW
 
+    def test_forced_reactivation_proceeds_when_the_copy_fails(self, sw, store):
+        """--force rewrites the live login even when the safety copy fails;
+        so it does when the key's Design login cannot be kept."""
+        self.key_active_with(sw, store, D4)
+        unreadable = patch.object(
+            CredentialStore, "peek_key_live_design", lambda self: (None, False)
+        )
+        with unreadable:
+            result = sw.switch_to(KEY_SLOT, json_output=True, force=True)
+        assert any("Design login" in w for w in result["warnings"])
+        assert sw._read_credentials() == API_KEY
+
     # -- slot lifecycle ------------------------------------------------------
 
     def test_remove_drops_it(self, sw, store):
@@ -501,4 +513,26 @@ class TestKeyDesignStoreMacOS:
 
         monkeypatch.setattr(macos_keychain, "get_password", fail)
         assert sw._store.read_key_design(KEY_SLOT, KEY_EMAIL) == (None, False)
+        # The switch's rollback snapshot of the store next to the key, too.
+        assert sw._store.peek_login_less() is None
         assert sw._store._use_keychain()
+
+    def test_activating_the_key_leaves_no_login_in_any_item(
+        self, sw, keychain, temp_home, monkeypatch  # noqa: F811
+    ):
+        """CLAUDE_CONFIG_DIR naming the default profile: two OAuth items
+        (Claude Code's hashed one and the legacy unsuffixed one). Writing the
+        key's Design login must not leave the outgoing login in the other."""
+        from claude_swap.credentials import login_less_blob
+        from claude_swap.session import keychain_service_name
+
+        config_dir = str(temp_home / ".claude")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir)
+        hashed = keychain_service_name(config_dir)
+        for service in (hashed, CLAUDE_CODE_KEYCHAIN_SERVICE):
+            keychain.put(service, _login("1", D1))
+
+        sw._store._write_credentials(API_KEY, login_less_blob({}, D4))
+
+        assert keychain.get_json(hashed) == {"designOauth": D4}
+        assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) is None

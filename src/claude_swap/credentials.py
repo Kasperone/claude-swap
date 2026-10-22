@@ -1058,9 +1058,9 @@ class CredentialStore:
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         # A login-less blob cannot shadow it (the active read holds one back),
-        # so the key slot's own Design login is written in its place.
-        if not self._write_login_less(login_less):
-            self._clear_oauth_credential()
+        # so the key slot's own Design login is then written in its place.
+        self._clear_oauth_credential()
+        self._write_login_less(login_less)
         if self._host.platform == Platform.MACOS and not wrote_to_keychain:
             # Same stale-Keychain resurrection guard as the OAuth path: the key
             # fell back to plaintext ``primaryApiKey`` while a stale "Claude Code"
@@ -1125,24 +1125,21 @@ class CredentialStore:
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
 
-    def _write_login_less(self, login_less: str | None) -> bool:
-        """Put an API-key slot's login-less blob into the OAuth store.
+    def _write_login_less(self, login_less: str | None) -> None:
+        """Put an API-key slot's login-less blob into the cleared OAuth store.
 
-        Returns whether it landed. ``None`` (no Design login) and a failed
-        write answer False and the caller clears the store as before: the
-        Design login is still in the slot's sidecar, so a failure only
-        defers it to the next activation.
+        Nothing for ``None`` (no Design login). A failed write leaves the
+        store cleared, as before: the Design login is still in the slot's
+        sidecar, so a failure only defers it to the next activation.
         """
         if login_less is None or not is_login_less(login_less):
-            return False
+            return
         try:
             self._write_oauth_credentials(login_less)
         except CredentialWriteError as e:
             self._host._logger.warning(
                 f"Could not keep the API key's Design login in the store: {e}"
             )
-            return False
-        return True
 
     def _clear_oauth_credential(self) -> None:
         """Clear the active OAuth credential — Keychain item and plaintext file.
@@ -1201,8 +1198,6 @@ class CredentialStore:
         """The active store's login-less blob, verbatim, or ``None``.
 
         Read like :meth:`residual_shared_fields` (the item, then the file).
-        A switch away from an API key snapshots it, so a rollback puts the
-        key back together with what Claude Code kept next to it.
         """
         if self._use_keychain():
             value, _failed = self._read_active_oauth_keychain()
@@ -1265,38 +1260,52 @@ class CredentialStore:
             return None, False
         return design_oauth_of(text), True
 
-    def peek_key_live_design(self) -> tuple[dict | None, bool]:
-        """The store's Design login while a managed key is active, for capture.
+    def _peek_live_blob(self, attempts: int = 1) -> tuple[str | None, bool]:
+        """The active store's raw blob as Claude Code reads it, routing aside.
 
-        Claude Code's own read order, whatever cswap's routing says: on macOS
-        the item first (directly, never through ``_kc_call``, with the bounded
-        retry of the active read), then the plaintext file, which Claude Code
-        also falls back to when the item cannot be read. A failed active read
-        earlier in the switch has moved cswap's routing to the file, but the
-        item may still hold the key's Design login, and the activation that
-        follows deletes it. ``(None, False)`` only when the file is unreadable.
+        On macOS the item first (directly, never through ``_kc_call``, up to
+        ``attempts`` tries), then the plaintext file, which Claude Code also
+        falls back to when the item cannot be read. For callers about to
+        write the store: a transient failure here must not move that write
+        to the file. ``(None, False)`` only when the file is unreadable.
         """
         if self._host.platform == Platform.MACOS:
             account = macos_keychain.keychain_account_name()
             for service in _active_oauth_keychain_services():
                 value = None
-                for attempt in range(_ACTIVE_READ_ATTEMPTS):
+                for attempt in range(attempts):
                     try:
                         value = macos_keychain.get_password(service, account)
                         break
                     except macos_keychain.KEYCHAIN_ERRORS:
-                        if attempt + 1 < _ACTIVE_READ_ATTEMPTS:
+                        if attempt + 1 < attempts:
                             time.sleep(_ACTIVE_READ_RETRY_DELAY)
                 if value:
-                    return design_oauth_of(value), True
+                    return value, True
         cred_file = get_credentials_path()
         try:
-            text = cred_file.read_text(encoding="utf-8")
+            return cred_file.read_text(encoding="utf-8"), True
         except FileNotFoundError:
             return None, True
         except (OSError, ValueError):
             return None, False
-        return design_oauth_of(text), True
+
+    def peek_key_live_design(self) -> tuple[dict | None, bool]:
+        """The store's Design login while a managed key is active, for capture.
+
+        Read like :meth:`_peek_live_blob`, with the bounded retry of the
+        active read: a failed active read earlier in the switch has moved
+        cswap's routing to the file, but the item may still hold the key's
+        Design login, and the activation that follows deletes it.
+        """
+        blob, readable = self._peek_live_blob(_ACTIVE_READ_ATTEMPTS)
+        return design_oauth_of(blob), readable
+
+    def peek_login_less(self) -> str | None:
+        """The active store's login-less blob, read like :meth:`_peek_live_blob`
+        (a switch snapshots it before writing, for its rollback)."""
+        blob, _readable = self._peek_live_blob()
+        return blob if is_login_less(blob) else None
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.

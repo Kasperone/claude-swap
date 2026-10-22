@@ -21,6 +21,7 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    CredentialError,
     CredentialReadError,
     LockError,
     SessionError,
@@ -809,7 +810,8 @@ class ClaudeAccountSwitcher:
             return None
         shared = shared_credential_fields(live_credentials)
         if shared is None:
-            shared = self._store.residual_shared_fields()
+            # Read without changing routing: the key is written next.
+            shared = shared_credential_fields(self._store.peek_login_less())
         return login_less_blob(shared, design)
 
     def key_design_for_export(
@@ -914,8 +916,12 @@ class ClaudeAccountSwitcher:
         When there is no live JSON credential object (fresh machine, or a
         managed API key is active), the shared fields come from a login-less
         blob Claude Code wrote into the active store while the key was active;
-        with none the stored blob activates unchanged, exactly as before.
+        with none the stored blob activates unchanged, exactly as before. A
+        managed key activates unchanged too (without that read): its OAuth
+        store is composed by :meth:`_key_login_less`.
         """
+        if looks_like_api_key(target_credentials):
+            return target_credentials
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:
             live_shared = self._store.residual_shared_fields()
@@ -7602,9 +7608,10 @@ class ClaudeAccountSwitcher:
 
                 # A live API key's Design login is not part of the key: snapshot
                 # it for the rollback, and when --force replaces a managed key
-                # (its backup is skipped), keep it in the key's slot first.
+                # (its backup is skipped), keep it in the key's slot first --
+                # best effort, like the safety copy above under --force.
                 rollback_login_less = (
-                    self._store.live_login_less()
+                    self._store.peek_login_less()
                     if looks_like_api_key(rollback_creds)
                     else None
                 )
@@ -7614,7 +7621,20 @@ class ClaudeAccountSwitcher:
                     and looks_like_api_key(rollback_creds)
                     and self._account_kind(current_account) == "api_key"
                 ):
-                    self._capture_key_design(current_account, current_identity[0])
+                    try:
+                        self._capture_key_design(
+                            current_account, current_identity[0]
+                        )
+                    except (SwitchError, CredentialError, OSError) as e:
+                        msg = (
+                            "Could not keep the API key's Claude Design login "
+                            f"({e}) — proceeding because --force explicitly "
+                            "rewrites the live login."
+                        )
+                        if emit_output:
+                            warning(msg)
+                        else:
+                            warnings_out.append(msg)
 
                 creds_written = False
                 config_written = False
@@ -7751,7 +7771,7 @@ class ClaudeAccountSwitcher:
                 original_email=current_email,
                 config_path=config_path,
                 original_login_less=(
-                    self._store.live_login_less()
+                    self._store.peek_login_less()
                     if looks_like_api_key(original_creds)
                     else None
                 ),
