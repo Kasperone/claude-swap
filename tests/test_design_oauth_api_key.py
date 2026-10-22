@@ -543,6 +543,31 @@ class TestKeyDesignStoreMacOS:
         assert sw._store.peek_login_less() is None
         assert sw._store._use_keychain()
 
+    def test_a_transient_item_failure_is_unreadable_for_the_capture(
+        self, sw, keychain, temp_home, monkeypatch  # noqa: F811
+    ):
+        """The item fails while cswap still trusts the Keychain: likely
+        transient, and the activation would delete what it holds, so the
+        capture must not read it as "no Design login"."""
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, json.dumps({"designOauth": D4}))
+        real = macos_keychain.get_password
+
+        def flaky(service, account):
+            if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                raise macos_keychain.KeychainError("fake: transient")
+            return real(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        assert sw._store.peek_key_live_design() == (None, False)
+
+        # A Keychain that has already failed this process (headless): the
+        # file is what Claude Code falls back to, and what is read.
+        sw._store._keychain_usable_cache = False
+        sw._store._keychain_op_failed = True
+        FileStore(temp_home / ".claude").write({"designOauth": D5})
+        assert sw._store.peek_key_live_design() == (D5, True)
+
     def test_activating_the_key_leaves_no_login_in_any_item(
         self, sw, keychain, temp_home, monkeypatch  # noqa: F811
     ):

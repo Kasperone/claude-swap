@@ -1260,28 +1260,40 @@ class CredentialStore:
             return None, False
         return design_oauth_of(text), True
 
-    def _peek_live_blob(self, attempts: int = 1) -> tuple[str | None, bool]:
+    def _peek_live_blob(
+        self, attempts: int = 1, *, strict: bool = False
+    ) -> tuple[str | None, bool]:
         """The active store's raw blob as Claude Code reads it, routing aside.
 
         On macOS the item first (directly, never through ``_kc_call``, up to
         ``attempts`` tries), then the plaintext file, which Claude Code also
         falls back to when the item cannot be read. For callers about to
         write the store: a transient failure here must not move that write
-        to the file. ``(None, False)`` only when the file is unreadable.
+        to the file. ``(None, False)`` when the file is unreadable, and with
+        ``strict`` also when the item failed while cswap's routing still
+        trusts the Keychain (no failure before this one: likely transient,
+        and the item may hold what the write is about to replace). Once a
+        failure has moved routing to the file, the file is read, as Claude
+        Code does on a Mac whose Keychain does not answer.
         """
         if self._host.platform == Platform.MACOS:
             account = macos_keychain.keychain_account_name()
             for service in _active_oauth_keychain_services():
                 value = None
+                failed = False
                 for attempt in range(attempts):
                     try:
                         value = macos_keychain.get_password(service, account)
+                        failed = False
                         break
                     except macos_keychain.KEYCHAIN_ERRORS:
+                        failed = True
                         if attempt + 1 < attempts:
                             time.sleep(_ACTIVE_READ_RETRY_DELAY)
                 if value:
                     return value, True
+                if failed and strict and self._use_keychain():
+                    return None, False
         cred_file = get_credentials_path()
         try:
             return cred_file.read_text(encoding="utf-8"), True
@@ -1293,12 +1305,11 @@ class CredentialStore:
     def peek_key_live_design(self) -> tuple[dict | None, bool]:
         """The store's Design login while a managed key is active, for capture.
 
-        Read like :meth:`_peek_live_blob`, with the bounded retry of the
-        active read: a failed active read earlier in the switch has moved
-        cswap's routing to the file, but the item may still hold the key's
-        Design login, and the activation that follows deletes it.
+        Read like :meth:`_peek_live_blob`, strictly, with the bounded retry of
+        the active read: the item may hold the key's Design login whatever
+        cswap's routing says, and the activation that follows deletes it.
         """
-        blob, readable = self._peek_live_blob(_ACTIVE_READ_ATTEMPTS)
+        blob, readable = self._peek_live_blob(_ACTIVE_READ_ATTEMPTS, strict=True)
         return design_oauth_of(blob), readable
 
     def peek_login_less(self) -> str | None:
