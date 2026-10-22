@@ -44,11 +44,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeCodeLockTimeout
-from claude_swap.paths import (
-    get_claude_config_home,
-    get_credentials_path,
-    get_global_config_path,
-)
+from claude_swap.paths import get_credentials_path, get_global_config_path
 
 # Claude Code's credential-refresh locks run ``stale: 60000, update: 5000``
 # (2.1.218 ``uKi``): a lock younger than 60s belongs to a live holder and
@@ -80,17 +76,21 @@ _logger = logging.getLogger("claude-swap")
 
 def credentials_lock_dir(config_home: Path | None = None) -> Path:
     """Legacy credential lock (``~/.claude.lock``) — CC still takes it for
-    compatibility; external exclusion today rests on this one. ``config_home``
-    names another profile's (a ``cswap run`` session) instead of the active
-    one."""
-    home = config_home if config_home is not None else get_claude_config_home()
+    compatibility; external exclusion today rests on this one. Beside the
+    secure-storage dir, like the primary lock (2.1.306/2.1.308:
+    ``${realpath(UL())}.lock``). ``config_home`` names another profile's (a
+    ``cswap run`` session) instead of the active one."""
+    home = config_home if config_home is not None else secure_storage_dir()
     return home.parent / (home.name + ".lock")
 
 
 def oauth_refresh_lock_dir(config_home: Path | None = None) -> Path:
-    """Claude Code's primary OAuth refresh lock
-    (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
-    home = config_home if config_home is not None else get_claude_config_home()
+    """Claude Code's primary OAuth refresh lock (2.1.218+).
+
+    In the secure-storage dir (2.1.306/2.1.308 take it in ``UL()``, the
+    directory of the store the refresh saves to): the config home, unless
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` points the store elsewhere."""
+    home = config_home if config_home is not None else secure_storage_dir()
     return home / ".oauth_refresh.lock"
 
 

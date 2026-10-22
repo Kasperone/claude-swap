@@ -538,9 +538,15 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
+        creds_text = entry["creds_text"]
+        if outcome != "imported":
+            # The slot's Design login is this account's and is not exported
+            # by default (``_slim_credentials``); an export is also often
+            # older than this machine's copy. Keep the later of the two.
+            creds_text = switcher._import_keeping_design(
+                target_num, entry["email"], creds_text
+            )
+        switcher._write_account_credentials(target_num, entry["email"], creds_text)
         switcher._write_account_config(
             target_num, entry["email"], entry["config_text"]
         )

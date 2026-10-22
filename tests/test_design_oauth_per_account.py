@@ -489,6 +489,37 @@ class MigrationScenarios:
         assert not session_mod.foreign_design_marker_for(p2).exists()
         assert _design(_backup(sw, "2")) is None
 
+    def test_busy_live_profile_is_stripped_by_a_later_usage_pass(
+        self, sw, temp_home, monkeypatch
+    ):
+        """Its claude held its locks during the migration: the next usage
+        pass that sees the session running strips the copy under them."""
+        from claude_swap import oauth
+
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        monkeypatch.setattr(session_mod, "profile_is_quiescent", lambda d: False)
+        monkeypatch.setattr(session_mod, "_LIVE_STRIP_LOCK_TIMEOUT", 0.1)
+        busy = p2 / ".design_oauth_refresh.lock"
+        busy.mkdir()
+        migrations.migrate_design_oauth_per_account(sw)
+        assert self.profile_blob(p2)["designOauth"] == D1_OLD
+        busy.rmdir()
+
+        monkeypatch.setattr(
+            sw, "_live_session_pids", lambda num, email: [4242] if num == "2" else []
+        )
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"utilization": 1}})):
+            record = sw._fetch_account_usage(
+                (2, _email("2"), "", "", False, _backup(sw, "2"), None)
+            )
+
+        assert record.error is None
+        assert "designOauth" not in self.profile_blob(p2)
+        assert session_mod.foreign_design_marker_for(p2).exists()  # until it exits
+
     def test_marked_profile_keeps_a_design_login_of_its_own_made_since(
         self, sw, temp_home, monkeypatch
     ):

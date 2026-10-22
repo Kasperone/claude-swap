@@ -1164,6 +1164,33 @@ class CredentialStore:
             return None, False
         return design_oauth_of(text), True
 
+    def peek_live_design_oauth(self) -> tuple[dict | None, bool]:
+        """:meth:`live_design_oauth` for a caller about to write the store.
+
+        One direct read per item, no retry, never through ``_kc_call``: a
+        transient Keychain failure here must not flip routing to file mode
+        for the write that follows (the file would then sit behind a stale
+        item). Unreadable answers ``(None, False)``.
+        """
+        if self._use_keychain():
+            for service in _active_oauth_keychain_services():
+                try:
+                    value = macos_keychain.get_password(
+                        service, macos_keychain.keychain_account_name()
+                    )
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    return None, False
+                if value:
+                    return design_oauth_of(value), True
+        cred_file = get_credentials_path()
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, True
+        except (OSError, ValueError):
+            return None, False
+        return design_oauth_of(text), True
+
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 

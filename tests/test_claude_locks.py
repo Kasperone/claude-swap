@@ -121,6 +121,28 @@ class TestCcRefreshLockProtocol:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert claude_locks.oauth_refresh_lock_dir() == custom / ".oauth_refresh.lock"
 
+    def test_locks_follow_the_secure_storage_dir(self, temp_home, tmp_path, monkeypatch):
+        """2.1.306/2.1.308 take the login-refresh locks in the secure-storage
+        dir (``UL()``), the directory of the store the refresh saves to: where
+        CLAUDE_SECURESTORAGE_CONFIG_DIR points it, not the config home."""
+        cfg, secure = tmp_path / "cfg", tmp_path / "secure"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+        assert claude_locks.oauth_refresh_lock_dir() == secure / ".oauth_refresh.lock"
+        assert credentials_lock_dir() == tmp_path / "secure.lock"
+        with claude_credentials_lock(), claude_locks.claude_store_locks():
+            for name in (".oauth_refresh.lock", ".design_oauth_refresh.lock",
+                         ".cloud_sessions_oauth_refresh.lock", ".storage-write.lock"):
+                assert (secure / name).is_dir(), name
+            assert (tmp_path / "secure.lock").is_dir()
+        assert not (cfg / ".oauth_refresh.lock").exists()
+        # Defined but empty: the default ~/.claude, whatever CLAUDE_CONFIG_DIR says.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        assert (
+            claude_locks.oauth_refresh_lock_dir()
+            == temp_home / ".claude" / ".oauth_refresh.lock"
+        )
+
     def test_credentials_lock_takes_both_locks(self, temp_home, monkeypatch):
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         new = temp_home / ".claude" / ".oauth_refresh.lock"

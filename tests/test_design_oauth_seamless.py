@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import migrations, oauth
+from claude_swap import macos_keychain, migrations, oauth, transfer
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 from claude_swap.models import Platform
 from claude_swap.session import keychain_service_name
@@ -291,6 +291,47 @@ class SeamlessScenarios:
         sw._adopt_session_credential("2", _email("2"), "")
         assert _design(_backup(sw, "2")) is None
 
+    def test_import_keeps_the_slots_own_design_login(self, sw, world, tmp_path):
+        """A default export carries the login only; importing it over the
+        slot (``--force``, or the dead-token auto-heal) renews the login and
+        keeps the account's own Design login."""
+        server, claude = world
+        export = tmp_path / "backup.cswap"
+        transfer.export_accounts(sw, str(export))  # before any Design login
+        claude.design_login("1")
+        sw.switch_to("2", json_output=True)  # account 1's is in its backup now
+        design = _design(_backup(sw, "1"))
+
+        transfer.import_accounts(sw, str(export), force=True)
+        assert _design(_backup(sw, "1")) == design
+        assert server.is_valid(design)
+
+        # The plain import that replaces a dead-token slot, same rule.
+        with patch.object(sw, "_slot_token_dead", lambda num, email: num == "1"):
+            transfer.import_accounts(sw, str(export))
+        assert _design(_backup(sw, "1")) == design
+
+        sw.switch_to("1", json_output=True)
+        assert self.live_store_design(claude) == design
+
+    def test_import_takes_a_later_design_login_from_a_full_export(
+        self, sw, world, tmp_path
+    ):
+        server, claude = world
+        claude.design_login("1")
+        sw.switch_to("2", json_output=True)
+        stored = _blob(_backup(sw, "1"))
+        later = server.refresh(stored["designOauth"]["refreshToken"])
+        sw._store._write_account_credentials(
+            "1", _email("1"), json.dumps({**stored, "designOauth": later})
+        )
+        export = tmp_path / "full.cswap"
+        transfer.export_accounts(sw, str(export), full=True)
+        sw._store._write_account_credentials("1", _email("1"), json.dumps(stored))
+
+        transfer.import_accounts(sw, str(export), force=True)
+        assert _design(_backup(sw, "1")) == later
+
     # -- the end-to-end scenario ---------------------------------------------
 
     def test_a_b_a_b_with_refreshes_and_a_running_session(self, sw, world):
@@ -392,3 +433,32 @@ class TestSeamlessMacOS(SeamlessScenarios):
 
     def profile_store(self, session_dir):
         return KeychainStore(session_dir, keychain_service_name(session_dir))
+
+    def test_a_failed_read_while_merging_keeps_the_live_write_in_the_keychain(
+        self, sw, world, temp_home, monkeypatch
+    ):
+        """The Design merge before the post-POST live write reads the item.
+        One transient failure there must not flip cswap to file mode for the
+        write itself: the refreshed login would land in a plaintext file the
+        (stale) item shadows, and Claude Code would keep the spent login."""
+        server, claude = world
+        claude.design_login("1")
+        real = macos_keychain.get_password
+        armed: list[int] = []
+
+        def flaky(service, account):
+            if armed and service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                armed.clear()
+                raise macos_keychain.KeychainError("fake: one transient failure")
+            return real(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+        self.active_refresh(sw, "1", during_post=lambda: armed.append(1))
+
+        assert not armed  # the failure did happen
+        item = json.loads(real(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+        ))
+        assert server.is_valid(item["claudeAiOauth"])
+        assert item["designOauth"] == server.current("1")
+        assert not (temp_home / ".claude" / ".credentials.json").exists()

@@ -724,7 +724,8 @@ def _assign_design_oauth(
                     f"{tag}: Account-{num} session profile holds Design login "
                     f"{fp} (Account-{owners[fp]}'s); a claude is running in it, "
                     + ("removed under its locks" if stripped
-                       else "marked for removal once it exits")
+                       else "its locks are busy: marked, and removed on a later "
+                            "usage pass or once it exits")
                 )
             else:
                 log.warning(

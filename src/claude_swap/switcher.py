@@ -3064,7 +3064,7 @@ class ClaudeAccountSwitcher:
     def _keep_store_design(self, working: str, start: str | None) -> str:
         """:meth:`_with_store_design` against the live store's Design login
         now; ``working`` unchanged when the store cannot be read."""
-        now_design, readable = self._store.live_design_oauth()
+        now_design, readable = self._store.peek_live_design_oauth()
         if not readable:
             return working
         return self._with_store_design(working, design_oauth_of(start), now_design)
@@ -3091,8 +3091,45 @@ class ClaudeAccountSwitcher:
             else:
                 yield True
 
+    def _import_keeping_design(
+        self, account_num: str, email: str, imported: str
+    ) -> str:
+        """An imported credential for an existing slot, as it may replace the slot's.
+
+        The import renews the login; the slot's Design login (account-owned,
+        left out of a default export) is kept unless the import carries a
+        strictly later one. An unreadable slot leaves the import as it is.
+        """
+        current, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable or not current:
+            return imported
+        imported_design = design_oauth_of(imported)
+        kept = newer_design_oauth(imported_design, design_oauth_of(current))
+        if kept is imported_design:
+            return imported
+        return with_design_oauth(imported, kept)
+
+    def _settle_running_profile(self, session_dir: Path) -> None:
+        """Strip a marked foreign Design login from a profile a claude runs in.
+
+        The per-account migration could only mark it when that profile's
+        own locks were busy; until it is gone, the running claude can refresh
+        (spend) the owner's copy. Each usage pass retries the strip under
+        those locks (``settle_foreign_design``). A cheap no-op without a
+        marker; never raises (it runs in the collect pass).
+        """
+        from claude_swap.session import foreign_design_marker_for, settle_foreign_design
+
+        if not foreign_design_marker_for(session_dir).exists():
+            return
+        try:
+            with FileLock(self.lock_file, timeout=2.0):
+                settle_foreign_design(session_dir)
+        except Exception as e:
+            self._logger.debug(f"Foreign Design login not settled yet: {e!r}")
+
     def _keep_design_of_wiped_login(
-        self, account_num: str, email: str, live: str
+        self, account_num: str, email: str, live: str, backup: str
     ) -> None:
         """Keep a wiped live login's Design login in the account's backup.
 
@@ -3100,10 +3137,11 @@ class ClaudeAccountSwitcher:
         tokens and leaves the rest of the blob, Design login included; that
         copy may be newer than the backup's (Claude Code refreshed it since
         the last capture, spending the backup's). The backup's login stays as
-        it is; only a strictly newer Design login is written in.
+        it is; only a strictly newer Design login is written in. ``backup``
+        is the switch's read of it ("" when absent or unreadable: nothing
+        written).
         """
-        backup, unreadable = self._read_account_credentials_ex(account_num, email)
-        if unreadable or not backup:
+        if not backup:
             return
         backup_design = design_oauth_of(backup)
         kept = newer_design_oauth(backup_design, design_oauth_of(live))
@@ -4688,12 +4726,7 @@ class ClaudeAccountSwitcher:
                         try:
                             self._write_account_credentials(
                                 account_num, email,
-                                self._capture_keeping_design(
-                                    live,
-                                    self._read_account_credentials(
-                                        account_num, email
-                                    ),
-                                ),
+                                self._capture_keeping_design(live, backup),
                             )
                         except Exception:
                             self._logger.warning(
@@ -4909,12 +4942,9 @@ class ClaudeAccountSwitcher:
                         try:
                             self._write_account_credentials(
                                 account_num, email,
-                                self._capture_keeping_design(
-                                    working,
-                                    self._read_account_credentials(
-                                        account_num, email
-                                    ),
-                                ),
+                                # The backup read above, not a new Keychain
+                                # read in the middle of the persist.
+                                self._capture_keeping_design(working, backup),
                             )
                         except Exception:
                             backup_ok = False
@@ -5197,6 +5227,8 @@ class ClaudeAccountSwitcher:
         # no persist): rotating the profile's family here would log the live
         # claude out the same way.
         session_dir = self._session_dir(str(num), email)
+        if has_live_session:
+            self._settle_running_profile(session_dir)
         session_creds = read_session_credentials(session_dir)
         if session_creds and session_identity_drifted(session_dir, email, org_uuid):
             # An in-session /login re-pointed the profile at a different
@@ -6814,6 +6846,7 @@ class ClaudeAccountSwitcher:
         original_creds: str,
         provenance: dict,
         data: dict,
+        backup: str | None = None,
     ) -> tuple[str, str | None]:
         """Decide what the switch-time backup may do with the live credential.
 
@@ -6866,7 +6899,8 @@ class ClaudeAccountSwitcher:
           endpoint state must never change switch behavior beyond skipping
           the extra safety.
         """
-        backup = self._read_account_credentials(current_account, current_email)
+        if backup is None:
+            backup = self._read_account_credentials(current_account, current_email)
         if backup and backup == original_creds:
             return ("own-bytes", None)
         if backup and (
@@ -7518,9 +7552,15 @@ class ClaudeAccountSwitcher:
                 # identity oracle is strictly advisory — "unresolved" falls
                 # back to the exact pre-fix backup, so endpoint state never
                 # decides whether a switch completes.
+                # One read of the outgoing backup serves the classification
+                # and the capture below (each extra Keychain read is one more
+                # chance to flip routing to file mode before the live write).
+                outgoing_backup = self._read_account_credentials(
+                    current_account, current_email
+                )
                 kind, foreign_slot = self._classify_outgoing_credential(
                     current_account, current_email, original_creds,
-                    provenance, data,
+                    provenance, data, backup=outgoing_backup,
                 )
                 if kind in ("foreign", "alien", "known-foreign"):
                     # Positively not this slot's bytes: never into a slot;
@@ -7587,7 +7627,8 @@ class ClaudeAccountSwitcher:
                     # The wipe left the rest of the blob alone: a newer
                     # Design login in it is still this account's.
                     self._keep_design_of_wiped_login(
-                        current_account, current_email, original_creds
+                        current_account, current_email, original_creds,
+                        outgoing_backup,
                     )
                     msg = (
                         "The live credential's tokens were wiped (Claude "
@@ -7614,10 +7655,7 @@ class ClaudeAccountSwitcher:
                     self._write_account_credentials(
                         current_account, current_email,
                         self._capture_keeping_design(
-                            original_creds,
-                            self._read_account_credentials(
-                                current_account, current_email
-                            ),
+                            original_creds, outgoing_backup
                         ),
                     )
                     self._write_account_config(
@@ -7645,10 +7683,7 @@ class ClaudeAccountSwitcher:
                     self._write_account_credentials(
                         current_account, current_email,
                         self._capture_keeping_design(
-                            original_creds,
-                            self._read_account_credentials(
-                                current_account, current_email
-                            ),
+                            original_creds, outgoing_backup
                         ),
                     )
                     self._write_account_config(
