@@ -134,6 +134,21 @@ class TestSwapOnKeychain:
 
         assert keychain.get(CLAUDE_CODE_KEYCHAIN_SERVICE) == target
 
+    def test_login_less_item_shadows_a_stale_plaintext_login(
+        self, switcher, keychain, temp_home
+    ):
+        # Claude Code reads the plaintext file only when the item is absent:
+        # with a (login-less) item present, a leftover file login is not the
+        # active credential.
+        _swap(switcher, API_KEY)
+        keychain.put(CLAUDE_CODE_KEYCHAIN_SERVICE, json.dumps({"designOauth": DESIGN}))
+        (temp_home / ".claude" / ".credentials.json").write_text(_login("fake-stale"))
+
+        assert switcher._read_credentials() == API_KEY
+
+        switcher._store._clear_managed_key()
+        assert switcher._read_credentials() == json.dumps({"designOauth": DESIGN})
+
     def test_api_key_to_oauth_without_residue_is_verbatim(self, switcher, keychain):
         _swap(switcher, API_KEY)
         target = _login("fake-target")

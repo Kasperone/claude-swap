@@ -752,9 +752,11 @@ class CredentialStore:
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
         # After a FAILED keychain read this file may hold a stale generation
         # (CC writes rotations keychain-only on macOS) — the flag travels as
-        # ``degraded`` so consume paths refuse these bytes.
+        # ``degraded`` so consume paths refuse these bytes. Not read when the
+        # item held a login-less blob: Claude Code falls back to the file only
+        # when the item is absent, so a leftover file login is not active.
         cred_file = get_credentials_path()
-        if cred_file.exists():
+        if residue is None and cred_file.exists():
             try:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
@@ -765,7 +767,7 @@ class CredentialStore:
                 # and sent the user to a re-login that cannot help.
                 return ActiveCredentials(None, keychain_failed, keychain_failed)
             if text.strip() and is_login_less(text):
-                residue = residue or ActiveCredentials(text, False, keychain_failed)
+                residue = ActiveCredentials(text, False, keychain_failed)
             elif text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
 

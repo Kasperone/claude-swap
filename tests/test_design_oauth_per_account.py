@@ -729,6 +729,25 @@ class TestMigrationLinux(MigrationScenarios):
         assert migrations.DESIGN_MIGRATION_ID not in _applied(sw)
         assert {n: _backup(sw, n) for n in ("1", "2", "3", "4")} == before
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_unreadable_profile_file_is_marked_not_skipped(self, sw, temp_home):
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        creds = p2 / ".credentials.json"
+        creds.chmod(0)
+        try:
+            assert migrations.migrate_design_oauth_per_account(sw) is True
+        finally:
+            creds.chmod(0o600)
+        assert session_mod.foreign_design_fingerprints(p2) == {
+            design_fingerprint(D1), design_fingerprint(D3)
+        }
+
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert _design(_backup(sw, "2")) is None
+        assert "designOauth" not in json.loads(creds.read_text())
+
     def test_runs_once_at_construction(self, sw, temp_home, monkeypatch):
         self._shared_era(sw, temp_home)
         _platform(monkeypatch, Platform.LINUX)  # constructs: runs migrations
@@ -801,6 +820,35 @@ class TestMigrationMacOS(MigrationScenarios):
         seed = json.loads(session_dir_creds(p2))
         assert "designOauth" not in seed
         assert seed["claudeAiOauth"]["expiresAt"] == 7000
+
+    def test_unreadable_profile_item_is_marked_not_skipped(
+        self, sw, temp_home, monkeypatch
+    ):
+        # The profile's item can't be read during the migration (a denied or
+        # timed-out Keychain prompt): whatever it holds of another account's
+        # is marked, never later taken for this account's own.
+        self._shared_era(sw, temp_home)
+        p2 = self.profile_put(sw, "2", _login("2", D1_OLD))
+        _identity_file(p2, "2")
+        locked = keychain_service_name(p2)
+        real = macos_keychain.get_password
+
+        def get_password(service, account):
+            if service == locked:
+                raise macos_keychain.KeychainError("denied")
+            return real(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", get_password)
+        assert migrations.migrate_design_oauth_per_account(sw) is True
+        # Every family another account owns: account 1's D1, account 3's D3.
+        assert session_mod.foreign_design_fingerprints(p2) == {
+            design_fingerprint(D1), design_fingerprint(D3)
+        }
+
+        monkeypatch.setattr(macos_keychain, "get_password", real)
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert _design(_backup(sw, "2")) is None
+        assert "designOauth" not in self.profile_blob(p2)
 
     def test_design_login_in_session_item_is_captured_into_its_slot(
         self, sw, temp_home

@@ -556,7 +556,7 @@ def _assign_design_oauth(
     from claude_swap.session import (
         mark_foreign_design,
         profile_is_quiescent,
-        _profile_design_oauth,
+        read_profile_design,
         strip_profile_design_oauth,
     )
 
@@ -592,6 +592,10 @@ def _assign_design_oauth(
     backups: dict[str, str] = {}
     backup_design: dict[str, dict | None] = {}
     profiles: dict[str, tuple[Path, dict]] = {}
+    # Profiles whose store could not be read (a denied or timed-out Keychain
+    # prompt): what they hold is unknown, so every family another account
+    # owns is marked there below, never left to read as this account's.
+    unread_profiles: dict[str, Path] = {}
     copies: dict[str, list[dict]] = {}
     unreadable = 0
     for num, info in accounts.items():
@@ -607,7 +611,9 @@ def _assign_design_oauth(
             copies.setdefault(design_fingerprint(design), []).append(design)
         session_dir = switcher._session_dir(num, email)
         if session_dir.is_dir():
-            pdesign = _profile_design_oauth(session_dir, own_only=False)
+            pdesign, profile_readable = read_profile_design(session_dir)
+            if not profile_readable:
+                unread_profiles[num] = session_dir
             if pdesign is not None:
                 profiles[num] = (session_dir, pdesign)
                 copies.setdefault(design_fingerprint(pdesign), []).append(pdesign)
@@ -731,6 +737,23 @@ def _assign_design_oauth(
             log.warning(
                 f"{tag}: Account-{num} session profile: could not remove Design "
                 f"login {fp} now; marked for removal"
+            )
+
+    for num, session_dir in unread_profiles.items():
+        foreign = sorted(fp for fp, owner in owners.items() if owner != num)
+        if not foreign:
+            continue
+        if all(mark_foreign_design(session_dir, fp) for fp in foreign):
+            changed += 1
+            log.warning(
+                f"{tag}: Account-{num} session profile could not be read; "
+                f"Design login(s) {', '.join(foreign)} of other accounts marked "
+                "for removal there in case it holds one"
+            )
+        else:
+            log.warning(
+                f"{tag}: Account-{num} session profile could not be read or "
+                "marked; a Design login of another account may remain there"
             )
     return changed, unreadable
 

@@ -375,21 +375,32 @@ def _profile_design_oauth(session_dir: Path, own_only: bool = True) -> dict | No
     off (the migration, which decides ownership itself). Best-effort — an
     unreadable store answers ``None``.
     """
+    design, _readable = read_profile_design(session_dir)
+    return own_design_oauth(session_dir, design) if own_only else design
+
+
+def read_profile_design(session_dir: Path) -> tuple[dict | None, bool]:
+    """The profile's raw ``designOauth`` and whether its store was readable.
+
+    Same read order as :func:`_profile_design_oauth`. ``(None, True)`` when
+    there is none (no item, no file); ``(None, False)`` when the first item
+    or the file could not be read.
+    """
     if Platform.detect() == Platform.MACOS:
         for service in _keychain_services(str(session_dir)):
             try:
                 value = _keychain_entry(service, strict=False)
             except macos_keychain.KEYCHAIN_ERRORS:
-                return None
+                return None, False
             if value is not None:
-                design = design_oauth_of(value)
-                return own_design_oauth(session_dir, design) if own_only else design
+                return design_oauth_of(value), True
     try:
         text = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
     except (OSError, ValueError):
-        return None
-    design = design_oauth_of(text)
-    return own_design_oauth(session_dir, design) if own_only else design
+        return None, False
+    return design_oauth_of(text), True
 
 
 def settle_foreign_design(session_dir: Path) -> None:
