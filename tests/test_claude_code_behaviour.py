@@ -185,26 +185,29 @@ class TestOwnershipAndLocks:
         store = temp_home / ".claude" / ".credentials.json"
         store.write_text(_login("1", DESIGN))
         held = threading.Event()
-        release = threading.Event()
+        written_while_held: list[bool] = []
 
         def hold() -> None:
+            # Hold for 3 s, watching the store: a logout removes it, so any
+            # change while the lock is held is a write that did not wait.
             with claude_store_write_lock(temp_home / ".claude"):
                 held.set()
-                release.wait(30)
+                before = store.read_text()
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if not store.exists() or store.read_text() != before:
+                        written_while_held.append(True)
+                        break
+                    time.sleep(0.05)
 
         holder = threading.Thread(target=hold)
         holder.start()
         assert held.wait(10)
-        timer = threading.Timer(3.0, release.set)
-        timer.start()
-        start = time.monotonic()
         try:
             result = claude(temp_home, "auth", "logout")
         finally:
-            release.set()
-            holder.join(10)
-        elapsed = time.monotonic() - start
+            holder.join(30)
 
         assert result.returncode == 0, result.stderr
-        assert elapsed >= 2.5, f"Claude Code wrote while cswap held the lock ({elapsed:.2f}s)"
+        assert not written_while_held, "Claude Code wrote while cswap held the lock"
         assert not store.exists() or "designOauth" not in json.loads(store.read_text())
