@@ -137,14 +137,26 @@ class SeamlessScenarios:
 
     @staticmethod
     def live_session(session_dir: Path):
-        """A claude process registered as running in the profile."""
+        """A claude process registered as running in the profile. Ends like
+        claude does: the process exits and its record goes."""
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(600)"]
         )
         record_dir = session_dir / "sessions"
         record_dir.mkdir(parents=True, exist_ok=True)
-        (record_dir / f"{proc.pid}.json").write_text(json.dumps({"pid": proc.pid}))
-        return proc
+        record = record_dir / f"{proc.pid}.json"
+        record.write_text(json.dumps({"pid": proc.pid}))
+
+        class Session:
+            pid = proc.pid
+
+            @staticmethod
+            def end() -> None:
+                proc.kill()
+                proc.wait()
+                record.unlink(missing_ok=True)
+
+        return Session
 
     # -- regression tests ----------------------------------------------------
 
@@ -265,14 +277,13 @@ class SeamlessScenarios:
         _identity_file(session_dir, "2")
         session = FakeClaudeCode(server, self.profile_store(session_dir))
         session.mutate(lambda blob: {**blob, "designOauth": d1})  # the old seed
-        proc = self.live_session(session_dir)
+        running = self.live_session(session_dir)
         try:
             assert migrations.migrate_design_oauth_per_account(sw) is True
             assert session.refresh_design() == "needs_design_login"
             assert session.store.read()["claudeAiOauth"]  # its login stays
         finally:
-            proc.kill()
-            proc.wait()
+            running.end()
 
         assert server.is_valid(d1)
         assert claude.refresh_design() == "saved"
@@ -301,7 +312,7 @@ class SeamlessScenarios:
         _identity_file(session_dir, "3")
         session = FakeClaudeCode(server, self.profile_store(session_dir))
         session.design_login("3")  # once, inside the session
-        proc = self.live_session(session_dir)
+        running = self.live_session(session_dir)
         try:
             active = "2"
             for target in ("1", "2", "1", "2"):
@@ -322,8 +333,7 @@ class SeamlessScenarios:
                 active = target
                 self.assert_seamless(sw, server, claude, active, session_dir)
         finally:
-            proc.kill()
-            proc.wait()
+            running.end()
 
         # The session exits; the next usage/switch pass adopts its state.
         sw._adopt_session_credential("3", _email("3"), "")

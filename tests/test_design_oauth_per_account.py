@@ -1111,10 +1111,14 @@ class TestSessionFreshnessMacOS(SessionFreshnessScenarios):
             return real(svc, account)
 
         monkeypatch.setattr(macos_keychain, "get_password", get_password)
+        self._real_get = real
         return real
 
     def _item_design(self, session_dir) -> dict | None:
-        value = self.keychain.get(keychain_service_name(session_dir))
+        # Past the refusing reader: what the item really holds.
+        value = self._real_get(
+            keychain_service_name(session_dir), macos_keychain.keychain_account_name()
+        )
         return json.loads(value).get("designOauth") if value else None
 
     def test_unreadable_item_survives_an_invalidation(self, sw, temp_home, monkeypatch):
