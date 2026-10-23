@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+import json, os, shlex, sys
+
+DB = os.environ["FAKE_SECURITY_DB"]
+
+
+def load():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def run(argv):
+    db = load()
+    cmd, args = argv[0], argv[1:]
+    opts = {}
+    i = 0
+    while i < len(args):
+        if args[i] in ("-a", "-s", "-X"):
+            opts[args[i]] = args[i + 1]
+            i += 2
+        else:
+            opts[args[i]] = True
+            i += 1
+    key = "%s\0%s" % (opts.get("-s"), opts.get("-a"))
+    if cmd == "find-generic-password":
+        if key not in db:
+            return 44
+        if "-w" in opts:
+            print(db[key])
+        return 0
+    if cmd == "delete-generic-password":
+        if key not in db:
+            return 44
+        del db[key]
+    elif cmd == "add-generic-password":
+        if os.environ.get("FAKE_SECURITY_FAIL_ADD"):
+            print("fake security: write refused", file=sys.stderr)
+            return 45
+        db[key] = bytes.fromhex(opts["-X"]).decode()
+    else:
+        return 1
+    with open(DB, "w") as f:
+        json.dump(db, f)
+    return 0
+
+
+if sys.argv[1:2] == ["-i"]:
+    sys.exit(run(shlex.split(sys.stdin.readline())))
+sys.exit(run(sys.argv[1:]))

@@ -1,0 +1,136 @@
+# Branch-only CI for the designOauth branches: full suite on Linux, macOS and
+# Windows,
+# plus the designOauth tests against a REAL macOS Keychain (throwaway keychain,
+# password generated per run, fake credentials only).
+name: designOauth CI
+
+on:
+  push:
+    branches:
+      - fix/preserve-design-oauth
+      - fix/preserve-design-oauth-latest
+      - feat/per-account-design-oauth
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run the whole suite
+        run: uv run pytest -o faulthandler_timeout=600
+
+      - name: Create temporary keychain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          echo "::add-mask::$KEYCHAIN_PW"
+          KEYCHAIN="$RUNNER_TEMP/cswap-test.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Search list first, then default: macOS hides a default that is not
+          # in the search list.
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          echo "CSWAP_CI_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          # Generated per run and masked; the tests need it to unlock again
+          # after deliberately locking the keychain.
+          echo "CSWAP_CI_KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
+
+      - name: designOauth against the real Keychain (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        run: >
+          uv run pytest -o faulthandler_timeout=300 -v -n 0
+          tests/test_design_oauth_macos_real.py
+
+      - name: designOauth and Credential Manager detection on real Windows (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        # Verbose and -rs, so the log shows the real-Windows tests ran, not
+        # skipped. CSWAP_CI_CREDMAN lets test_windows_credman create and remove
+        # throwaway Credential Manager entries with fake values on this runner.
+        env:
+          CSWAP_CI_CREDMAN: '1'
+        run: >
+          uv run pytest -o faulthandler_timeout=300 -v -rs -n 0
+          tests/test_design_oauth_windows.py tests/test_windows_credman.py
+          tests/test_design_oauth_per_account.py tests/test_design_oauth_seamless.py
+
+      - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
+        shell: bash
+        env:
+          CC_PINNED_VERSION: 2.1.306
+        run: |
+          # Read-only: `npm pack` only downloads tarballs (no install scripts,
+          # no execution, no login); binaries are inspected as bytes. Runs
+          # against the pinned version AND the latest published one, for this
+          # runner's OS (darwin Keychain + plaintext, linux plaintext only,
+          # win32 plaintext unless Credential Manager is opted into), so a
+          # Claude Code release that changes the credential storage turns this
+          # red with the broken expectation named.
+          case "$RUNNER_OS" in
+            Linux) OS=linux; BIN=claude ;;
+            macOS) OS=darwin; BIN=claude ;;
+            Windows) OS=win32; BIN=claude.exe ;;
+          esac
+          ARCH="$(echo "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          PKG="@anthropic-ai/claude-code-$OS-$ARCH"
+          LATEST="$(npm view "$PKG" version)"
+          echo "package=$PKG pinned=$CC_PINNED_VERSION latest=$LATEST"
+          # Windows: a drive-letter path with forward slashes works for both
+          # Git Bash and the Windows Python reading the binary.
+          TMPROOT="$RUNNER_TEMP"
+          command -v cygpath >/dev/null && TMPROOT="$(cygpath -m "$RUNNER_TEMP")"
+          ARGS=()
+          for VERSION in "$CC_PINNED_VERSION" "$LATEST"; do
+            DIR="$TMPROOT/cc-$VERSION"
+            [ -d "$DIR" ] && continue
+            mkdir -p "$DIR/extract"
+            (cd "$DIR" && npm pack "$PKG@$VERSION" --silent >/dev/null \
+              && tar -xzf ./*.tgz -C extract)
+            ARGS+=("$VERSION=$DIR/extract/package/$BIN")
+          done
+          uv run python .github/scripts/check_claude_code_keychain.py "${ARGS[@]}"
+
+      - name: Run the real Claude Code next to cswap (Linux; no network, fake credentials)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The tests run the binaries downloaded above, each call inside
+          # `unshare -rn` (a network namespace with no route out), and refuse
+          # to run them otherwise. Ubuntu 24.04 restricts unprivileged user
+          # namespaces through AppArmor; lift that for this runner.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn true
+          shopt -s nullglob
+          BINARIES=("$RUNNER_TEMP"/cc-*/extract/package/claude)
+          [ ${#BINARIES[@]} -gt 0 ] || { echo "::error::no Claude Code binary"; exit 1; }
+          for BINARY in "${BINARIES[@]}"; do
+            echo "== $BINARY"
+            CSWAP_CC_BINARY="$BINARY" uv run pytest -v -rs -n 0 \
+              -o faulthandler_timeout=300 tests/test_claude_code_behaviour.py
+          done
+
+      - name: Delete temporary keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: security delete-keychain "$CSWAP_CI_KEYCHAIN" || true

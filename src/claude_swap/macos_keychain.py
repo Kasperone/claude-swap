@@ -36,6 +36,7 @@ its functions are only meaningful on macOS.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -73,6 +74,9 @@ class KeychainError(Exception):
 KEYCHAIN_ERRORS = (KeychainError, subprocess.TimeoutExpired, OSError)
 
 
+_ACCOUNT_NAME_RE = re.compile(r"[a-zA-Z0-9._-]+")
+
+
 def keychain_account_name() -> str:
     """Account name for the active-credential Keychain item, mirroring Claude
     Code's ``getUsername()`` (``utils/secureStorage/macOsKeychainHelpers.ts``).
@@ -83,14 +87,17 @@ def keychain_account_name() -> str:
     than Claude Code, so the two could not see each other's active credential.
     """
     user = os.environ.get("USER")
-    if user:
-        return user
-    try:
-        import pwd  # POSIX-only; the account-name call sites are macOS-only
+    if not user:
+        try:
+            import pwd  # POSIX-only; the account-name call sites are macOS-only
 
-        return pwd.getpwuid(os.geteuid()).pw_name
-    except Exception:
-        return "claude-code-user"
+            user = pwd.getpwuid(os.geteuid()).pw_name
+        except Exception:
+            return "claude-code-user"
+    # Claude Code falls back to the same constant for a name outside this set
+    # (a space, a domain\user form, ...); keying a different item would hide
+    # the live credential from it.
+    return user if _ACCOUNT_NAME_RE.fullmatch(user) else "claude-code-user"
 
 
 def _quote(value: str) -> str:

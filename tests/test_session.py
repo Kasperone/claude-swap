@@ -235,6 +235,12 @@ class TestHelpers:
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
+    def test_probe_env_drops_the_secure_storage_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        env = _probe_env(tmp_path)
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
     def test_scan_live_sessions_missing_dir(self, tmp_path):
         assert scan_live_sessions(tmp_path / "nope") == ([], 0)
 
@@ -1308,6 +1314,30 @@ class TestRun:
             manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         assert call.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
+    @pytest.mark.parametrize("value", ["/shared/secure", ""])
+    def test_exec_env_drops_the_secure_storage_override(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        monkeypatch,
+        capsys,
+        value,
+    ):
+        # Defined (even empty) it would point the session at another
+        # profile's store for every key of the login blob.
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=True)
+
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in exc.value.env
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        assert "Ignoring CLAUDE_SECURESTORAGE_CONFIG_DIR" in capsys.readouterr().out
 
     def test_fast_path_for_active_account(
         self, manager, capture_exec, monkeypatch, capsys
