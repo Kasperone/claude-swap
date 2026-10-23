@@ -38,6 +38,7 @@ from claude_swap.paths import get_credentials_path
 from claude_swap.session import SessionManager, session_dir_for
 
 from tests.test_design_oauth_per_account import (  # noqa: F401
+    API_KEY,
     _email,
     _identity_file,
     _roster,
@@ -166,6 +167,28 @@ class TestPerAccountWithCswap:
 
         sw.switch_to("1", json_output=True)
         assert signed_in(temp_home)
+
+    def test_api_key_account_keeps_its_design_login(self, linux, temp_home, isolated):  # noqa: F811
+        """With a managed API key active there is no claude.ai login: the
+        ``/design-login`` saved next to the key is Claude Code's only Design
+        credential. A switch away and back gives it back to Claude Code."""
+        sw = linux
+        _roster(sw, temp_home, {"1": _login("1", DESIGN), "2": _login("2")},
+                active="1")
+        sw.add_account_from_token(API_KEY, slot=4)
+        sw.switch_to("4", json_output=True)
+        assert not signed_in(temp_home)  # account 1's went with its login
+
+        # What /design-login saves while the key is active.
+        store = temp_home / ".claude" / ".credentials.json"
+        store.write_text(json.dumps({"designOauth": {**DESIGN, "accessToken": "fake-4"}}))
+        assert signed_in(temp_home)
+
+        sw.switch_to("2", json_output=True)
+        assert not signed_in(temp_home)
+        sw.switch_to("4", json_output=True)
+        assert signed_in(temp_home)
+        assert json.loads(store.read_text())["designOauth"]["accessToken"] == "fake-4"
 
 
 class TestOwnershipAndLocks:

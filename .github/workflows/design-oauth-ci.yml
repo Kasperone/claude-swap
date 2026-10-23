@@ -10,6 +10,7 @@ on:
       - fix/preserve-design-oauth
       - fix/preserve-design-oauth-latest
       - feat/per-account-design-oauth
+      - feat/api-key-design-oauth
   workflow_dispatch:
 
 permissions:
@@ -75,6 +76,7 @@ jobs:
           uv run pytest -o faulthandler_timeout=300 -v -rs -n 0
           tests/test_design_oauth_windows.py tests/test_windows_credman.py
           tests/test_design_oauth_per_account.py tests/test_design_oauth_seamless.py
+          tests/test_design_oauth_api_key.py
 
       - name: Check cswap's credential-store naming against Claude Code (pinned + latest)
         shell: bash

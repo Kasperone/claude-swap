@@ -252,6 +252,9 @@ class SwitchTransaction:
     original_email: str
     config_path: Path
     completed_steps: list[str] = field(default_factory=list)
+    # What Claude Code kept next to an outgoing API key (its Design login,
+    # shared fields): restored with the key, which alone would clear it.
+    original_login_less: str | None = None
 
     def record_step(self, step: str) -> None:
         """Record a completed step."""
@@ -267,7 +270,9 @@ class SwitchTransaction:
         for step in reversed(self.completed_steps):
             try:
                 if step == "credentials_written":
-                    switcher._write_credentials(self.original_credentials)
+                    switcher._activate_credentials(
+                        self.original_credentials, self.original_login_less
+                    )
                 elif step == "config_written":
                     # By rename, never in place (#419): see atomic_write_text.
                     atomic_write_text(self.config_path, self.original_config)

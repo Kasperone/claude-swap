@@ -20,6 +20,7 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    CredentialError,
     CredentialReadError,
     LockError,
     SessionError,
@@ -55,6 +56,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     CredentialStore,
     design_fingerprint,
     design_oauth_of,
+    login_less_blob,
     looks_like_api_key,
     merge_shared_credential_fields,
     newer_design_oauth,
@@ -295,6 +297,11 @@ def _same_directory(left: Path, right: Path) -> bool:
         return left.resolve() == right.resolve()
     except OSError:  # unreadable mount / permission — compare as written
         return left == right
+
+
+def _design_text(design: dict | None) -> str:
+    """An API-key slot's Design login as swap staging parks it ("" = none)."""
+    return json.dumps({"designOauth": design}) if design is not None else ""
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -754,8 +761,130 @@ class ClaudeAccountSwitcher:
         # not the one being added.
         return self._store._read_managed_key()
 
-    def _write_credentials(self, credentials: str) -> None:
-        self._store._write_credentials(credentials)
+    def _write_credentials(
+        self, credentials: str, login_less: str | None = None
+    ) -> None:
+        self._store._write_credentials(credentials, login_less)
+
+    def _activate_credentials(self, credentials: str, login_less: str | None) -> None:
+        """Write the credential being activated, with the API-key slot's
+        login-less blob when it has one (:meth:`_key_login_less`)."""
+        if login_less is None:
+            self._write_credentials(credentials)
+        else:
+            self._write_credentials(credentials, login_less)
+
+    def _key_login_less(
+        self,
+        account_num: str,
+        email: str,
+        target_credentials: str,
+        live_credentials: str | None,
+    ) -> str | None:
+        """What activating an API-key slot leaves in the OAuth store.
+
+        The slot's own Design login (its sidecar) with the machine's shared
+        fields, the live store's current generation of those (as
+        :meth:`_prepare_credentials_for_activation` takes them); ``None``
+        for an OAuth target or a key slot without a Design login, which
+        clears the store as before. An unreadable sidecar activates the key
+        without it: the copy stays stored for the next activation.
+        """
+        if not looks_like_api_key(target_credentials):
+            return None
+        design, readable = self._store.read_key_design(account_num, email)
+        if not readable:
+            self._logger.warning(
+                f"Account-{account_num}'s Design login could not be read; "
+                "activating its API key without it"
+            )
+            return None
+        if design is None:
+            return None
+        shared = shared_credential_fields(live_credentials)
+        if shared is None:
+            # Read without changing routing: the key is written next.
+            shared = shared_credential_fields(self._store.peek_login_less())
+        return login_less_blob(shared, design)
+
+    def key_design_for_export(
+        self, account_num: str, email: str, is_active: bool
+    ) -> dict | None:
+        """An API-key account's Design login for a ``--full`` export: the
+        stored one, or for the active key the later of it and the live one.
+        Raises :class:`CredentialReadError` when either cannot be read."""
+        stored, readable = self._store.read_key_design(account_num, email)
+        if not readable:
+            raise CredentialReadError(
+                f"the stored Design login of account {account_num} ({email}) "
+                "could not be read"
+            )
+        if not is_active:
+            return stored
+        live, live_readable = self._store.peek_key_live_design()
+        if not live_readable:
+            raise CredentialReadError("the live Design login could not be read")
+        return newer_design_oauth(live, stored)
+
+    def import_key_design(
+        self,
+        account_num: str,
+        email: str,
+        imported: dict | None,
+        *,
+        was_api_key: bool,
+        is_api_key: bool,
+    ) -> None:
+        """Set an imported slot's API-key Design login.
+
+        An API-key slot keeps the later of its own and the imported one (a
+        default export carries none); a slot that was not one gets the
+        imported one, and a slot imported as OAuth drops any stray one, so
+        no other account's copy is ever activated with the key.
+        """
+        if not is_api_key:
+            if was_api_key:
+                self._store.delete_key_design(account_num, email)
+            return
+        current = None
+        if was_api_key:
+            current, readable = self._store.read_key_design(account_num, email)
+            if not readable:
+                return  # keep whatever is there; the import renews the key only
+        kept = newer_design_oauth(imported, current)
+        if kept is None:
+            self._store.delete_key_design(account_num, email)
+        elif kept != current:
+            self._store.write_key_design(account_num, email, kept)
+
+    def _capture_key_design(self, account_num: str, email: str) -> None:
+        """Keep an outgoing API-key slot's Design login before it is replaced.
+
+        The live one (a ``/design-login`` made, or refreshed by Claude Code,
+        while the key was active) goes into the slot's sidecar, unless the
+        sidecar holds a strictly later generation; with none live the
+        sidecar's is kept (the rule of :meth:`_capture_keeping_design`).
+        Raises :class:`SwitchError` when the live store cannot be read and
+        lets a failed write raise: the live copy may be the only one, and the
+        activation that follows replaces it, so the switch must stop first.
+        """
+        live, readable = self._store.peek_key_live_design()
+        if not readable:
+            raise SwitchError(
+                "The live Claude Design login could not be read; nothing was "
+                "changed. Retry the switch."
+            )
+        if live is None:
+            return
+        stored, stored_readable = self._store.read_key_design(account_num, email)
+        kept = newer_design_oauth(live, stored) if stored_readable else live
+        if kept == stored:
+            return
+        self._store.write_key_design(account_num, email, kept)
+        self._logger.info(
+            f"Kept account {account_num}'s Design login ({design_fingerprint(kept)}) "
+            "with its API key"
+        )
 
     def _prepare_credentials_for_activation(
         self, target_credentials: str, live_credentials: str | None
@@ -780,8 +909,12 @@ class ClaudeAccountSwitcher:
         When there is no live JSON credential object (fresh machine, or a
         managed API key is active), the shared fields come from a login-less
         blob Claude Code wrote into the active store while the key was active;
-        with none the stored blob activates unchanged, exactly as before.
+        with none the stored blob activates unchanged, exactly as before. A
+        managed key activates unchanged too (without that read): its OAuth
+        store is composed by :meth:`_key_login_less`.
         """
+        if looks_like_api_key(target_credentials):
+            return target_credentials
         live_shared = shared_credential_fields(live_credentials)
         if live_shared is None:
             live_shared = self._store.residual_shared_fields()
@@ -1131,6 +1264,23 @@ class ClaudeAccountSwitcher:
             )
         return creds
 
+    def _key_design_or_abort(
+        self, account_num: str, email: str, record: dict
+    ) -> dict | None:
+        """An API-key slot's Design login for swap/move's snapshot (``None``
+        for an OAuth slot, which keeps its own in the backup); raises on an
+        unreadable one, before anything has moved."""
+        if record.get("kind") != "api_key":
+            return None
+        design, readable = self._store.read_key_design(account_num, email)
+        if not readable:
+            raise ConfigError(
+                f"Account-{account_num}'s stored Design login could not be "
+                "read (keychain unavailable?); nothing was changed. Retry "
+                "once it is readable again."
+            )
+        return design
+
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
 
@@ -1177,6 +1327,11 @@ class ClaudeAccountSwitcher:
         creds_b = self._read_backup_or_abort(num_b, email_b)
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
+        # An API-key slot's Design login moves with it (OAuth slots keep
+        # theirs in the backup). Untouched when neither slot is a key.
+        keyed = "api_key" in (record_a.get("kind"), record_b.get("kind"))
+        design_a = self._key_design_or_abort(num_a, email_a, record_a)
+        design_b = self._key_design_or_abort(num_b, email_b, record_b)
 
         staging: dict[str, Path] = {}
         try:
@@ -1186,9 +1341,10 @@ class ClaudeAccountSwitcher:
                 # Park durable copies first — a failure mid-write can then
                 # never leave a credential existing only in this process's
                 # memory. (Staging fails -> abort before anything changed.)
-                staging = self._stage_overlap_material(
-                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
-                )
+                staging = self._stage_overlap_material({
+                    num_a: (creds_a, config_a, _design_text(design_a)),
+                    num_b: (creds_b, config_b, _design_text(design_b)),
+                })
 
             # Move each session profile to its owner's new slot key. When both
             # accounts share an email the two paths swap directly, so stage the
@@ -1218,6 +1374,10 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(num_a, email_b, config_b)
             else:
                 self._delete_config_backup(num_a, email_b)
+            if keyed:
+                # Written or cleared (strictly), like the credentials.
+                self._store.write_key_design(num_b, email_a, design_a)
+                self._store.write_key_design(num_a, email_b, design_b)
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
@@ -1242,6 +1402,7 @@ class ClaudeAccountSwitcher:
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
                 staging,
+                designs=(design_a, design_b) if keyed else None,
             )
             raise
 
@@ -1303,7 +1464,7 @@ class ClaudeAccountSwitcher:
                 )
 
     def _stage_overlap_material(
-        self, material: dict[str, tuple[str, str]]
+        self, material: dict[str, tuple[str, ...]]
     ) -> dict[str, Path]:
         """Park slots' backup material in temp files before overlapping writes.
 
@@ -1340,8 +1501,8 @@ class ClaudeAccountSwitcher:
             self._discard_staging(staged)
 
         try:
-            for num, (creds, config) in material.items():
-                for kind, content in (("creds", creds), ("config", config)):
+            for num, contents in material.items():
+                for kind, content in zip(("creds", "config", "design"), contents):
                     if not content:
                         continue
                     path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
@@ -1439,6 +1600,7 @@ class ClaudeAccountSwitcher:
         creds_b: str,
         config_b: str,
         staging: dict[str, "Path"],
+        designs: tuple[dict | None, dict | None] | None = None,
     ) -> None:
         """Best-effort restore of both slots after a failed swap mutation.
 
@@ -1449,7 +1611,9 @@ class ClaudeAccountSwitcher:
         empty must go back to empty rather than keep the other account's
         credential. Every step is attempted independently; if any fails, the
         staged pre-swap copies are kept on disk for manual recovery instead
-        of being deleted.
+        of being deleted. ``designs`` are the two slots' API-key Design
+        logins when either slot is a key (restored, or cleared, last: a
+        strict credential clear drops the key's Design login too).
         """
         self._logger.error(
             f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
@@ -1485,6 +1649,18 @@ class ClaudeAccountSwitcher:
                 self._logger.error(
                     f"Rollback {kind} restore failed for slot {num}: {e}"
                 )
+        if designs is not None:
+            for num, email, design in (
+                (num_a, email_a, designs[0]),
+                (num_b, email_b, designs[1]),
+            ):
+                try:
+                    self._store.write_key_design(num, email, design)
+                except Exception as e:
+                    failures += 1
+                    self._logger.error(
+                        f"Rollback Design login restore failed for slot {num}: {e}"
+                    )
         if email_a != email_b:
             # Drop half-written copies under the new keys; the records still
             # point at the old slots. (When the emails match, the "new" keys
@@ -1632,6 +1808,7 @@ class ClaudeAccountSwitcher:
         # _read_backup_or_abort.
         creds = self._read_backup_or_abort(num_src, email)
         config = self._read_account_config(num_src, email)
+        design = self._key_design_or_abort(num_src, email, record)
 
         from claude_swap.session import move_profile_markers
 
@@ -1665,6 +1842,8 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(target, email, config)
             else:
                 self._delete_config_backup(target, email)
+            if record.get("kind") == "api_key":
+                self._store.write_key_design(target, email, design)
 
             data["accounts"][target] = record
             del data["accounts"][num_src]
@@ -3330,7 +3509,7 @@ class ClaudeAccountSwitcher:
             return
         updated = with_design_oauth(backup, kept)
         if updated == backup:
-            return  # an API-key slot owns no Design login
+            return  # an API key's Design login is kept beside it, not in it
         self._store._write_account_credentials(account_num, email, updated)
         self._logger.info(
             f"Kept account {account_num}'s Design login ({design_fingerprint(kept)}) "
@@ -3395,7 +3574,7 @@ class ClaudeAccountSwitcher:
             return False
         updated = with_design_oauth(backup, profile_design)
         if updated == backup:
-            return False  # not a Claude login: API-key slots own no Design login
+            return False  # not a Claude login (an API key's is kept beside it)
         self._store._write_account_credentials(account_num, email, updated)
         self._logger.info(
             f"Adopted account {account_num}'s session Design login "
@@ -4430,6 +4609,14 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        # A key account moving to another slot takes its Design login along;
+        # read before anything is deleted.
+        carried_design = None
+        if migrate_from and is_api_key:
+            carried_design = self._key_design_or_abort(
+                migrate_from, email, data["accounts"][migrate_from]
+            )
+
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -4439,6 +4626,11 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+
+        if carried_design is not None:
+            # Under the new key before the old one goes (a failure leaves
+            # the account where it was).
+            self._store.write_key_design(account_num, email, carried_design)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -7621,13 +7813,47 @@ class ClaudeAccountSwitcher:
                         else:
                             warnings_out.append(msg)
 
+                # A live API key's Design login is not part of the key: snapshot
+                # it for the rollback, and when --force replaces a managed key
+                # (its backup is skipped), keep it in the key's slot first --
+                # best effort, like the safety copy above under --force.
+                rollback_login_less = (
+                    self._store.peek_login_less()
+                    if looks_like_api_key(rollback_creds)
+                    else None
+                )
+                if (
+                    current_identity is not None
+                    and current_account is not None
+                    and looks_like_api_key(rollback_creds)
+                    and self._account_kind(current_account) == "api_key"
+                ):
+                    try:
+                        self._capture_key_design(
+                            current_account, current_identity[0]
+                        )
+                    except (SwitchError, CredentialError, OSError) as e:
+                        msg = (
+                            "Could not keep the API key's Claude Design login "
+                            f"({e}) — proceeding because --force explicitly "
+                            "rewrites the live login."
+                        )
+                        if emit_output:
+                            warning(msg)
+                        else:
+                            warnings_out.append(msg)
+
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(
+                    self._activate_credentials(
                         self._prepare_credentials_for_activation(
                             target_creds, rollback_creds
-                        )
+                        ),
+                        self._key_login_less(
+                            target_account, target_email, target_creds,
+                            rollback_creds,
+                        ),
                     )
                     creds_written = True
 
@@ -7688,7 +7914,9 @@ class ClaudeAccountSwitcher:
                             )
                     if creds_written and rollback_creds is not None:
                         try:
-                            self._write_credentials(rollback_creds)
+                            self._activate_credentials(
+                                rollback_creds, rollback_login_less
+                            )
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback credentials: {e}"
@@ -7748,6 +7976,11 @@ class ClaudeAccountSwitcher:
                 original_account_num=current_account,
                 original_email=current_email,
                 config_path=config_path,
+                original_login_less=(
+                    self._store.peek_login_less()
+                    if looks_like_api_key(original_creds)
+                    else None
+                ),
             )
 
             try:
@@ -7905,6 +8138,16 @@ class ClaudeAccountSwitcher:
                             acct["uuid"] = resolved["uuid"]
                     self._logger.info(f"Backed up account {current_account}")
 
+                # An API key's Design login lives beside the key in Claude
+                # Code's store, not in the key: keep it before the target
+                # replaces it.
+                if (
+                    kind in ("own-bytes", "own-family", "own-rotated", "unresolved")
+                    and looks_like_api_key(original_creds)
+                    and self._account_kind(current_account) == "api_key"
+                ):
+                    self._capture_key_design(current_account, current_email)
+
                 # Step 2: Retrieve target account
                 target_creds = self._read_target_credentials(
                     target_account, target_email
@@ -7918,10 +8161,13 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(
+                self._activate_credentials(
                     self._prepare_credentials_for_activation(
                         target_creds, original_creds
-                    )
+                    ),
+                    self._key_login_less(
+                        target_account, target_email, target_creds, original_creds
+                    ),
                 )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
@@ -8124,6 +8370,25 @@ class ClaudeAccountSwitcher:
                 # macOS Keychain items via `security` (current macOS backend).
                 if self.platform == Platform.MACOS:
                     for username in usernames:
+                        try:
+                            macos_keychain.delete_password(SECURITY_SERVICE, username)
+                            removed_items.append(f"Credential: {username}")
+                        except Exception:
+                            pass  # Ignore errors during purge
+
+                # An API-key slot's Design login (file, and macOS Keychain item).
+                if account_info.get("kind") == "api_key":
+                    design_file = self._store._key_design_path(account_num, email)
+                    try:
+                        if design_file.exists():
+                            design_file.unlink()
+                            removed_items.append(
+                                f"Credential file: {design_file.name}"
+                            )
+                    except Exception:
+                        pass  # Ignore errors during purge
+                    if self.platform == Platform.MACOS:
+                        username = self._store._key_design_username(account_num, email)
                         try:
                             macos_keychain.delete_password(SECURITY_SERVICE, username)
                             removed_items.append(f"Credential: {username}")

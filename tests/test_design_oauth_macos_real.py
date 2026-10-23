@@ -23,6 +23,10 @@ from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 
 # The classes under test are shared with the fake-CLI module; only the
 # ``keychain`` fixture below differs.
+from tests.test_design_oauth_api_key import (  # noqa: F401
+    TestKeyDesignMacOS,
+    TestKeyDesignStoreMacOS,
+)
 from tests.test_design_oauth_macos import (  # noqa: F401
     ACCOUNT,
     DESIGN,
