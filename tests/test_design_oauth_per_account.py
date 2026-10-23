@@ -175,6 +175,71 @@ class TestSwitchMatrix:
         assert sw._read_account_credentials("4", "api-key-4@token.local") == API_KEY
 
 
+class TestActiveRefreshLiveWrite:
+    """cswap's refresh of the default login from the slot backup: the live
+    write takes the shared fields from the live store, and the Design login
+    Claude Code holds there now."""
+
+    def test_backup_sourced_refresh_keeps_live_mcp_and_design(
+        self, linux, temp_home
+    ):
+        from claude_swap import oauth
+
+        sw = linux
+        mcp_stale, mcp_current = {"srv": "stale"}, {"srv": "current"}
+        backup = {**json.loads(_login("1", D1)), "mcpOAuth": mcp_stale}
+        _roster(sw, temp_home, {"1": json.dumps(backup)}, active="1")
+        # The live store holds an older, foreign-lineage generation, so the
+        # refresh POSTs the backup's grant; its mcpOAuth is the current one.
+        live_text = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "fake-login-1-at-old",
+                "refreshToken": "fake-login-1-rt-old",
+                "expiresAt": 4000,
+            },
+            "designOauth": D1,
+            "mcpOAuth": mcp_current,
+        })
+        sw._write_credentials(live_text)
+        live = _live_file(temp_home)
+        newer = {**D1, "accessToken": "fake-d1-newer", "expiresAt": 9000}
+
+        def refresh(creds, **_kw):
+            blob = json.loads(creds)
+            blob["claudeAiOauth"] = {
+                "accessToken": "fake-login-1-at-posted",
+                "refreshToken": "fake-login-1-rt-posted",
+                "expiresAt": 99000,
+            }
+            return oauth.RefreshOutcome(json.dumps(blob), None)
+
+        real_backup_write = sw._write_account_credentials
+
+        def backup_write(*args):
+            real_backup_write(*args)
+            # Claude Code saves a Design refresh after the backup write and
+            # before cswap's live write.
+            live.write_text(json.dumps(
+                {**json.loads(live.read_text()), "designOauth": newer}
+            ))
+
+        with (
+            patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                  side_effect=refresh),
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})),
+            patch.object(sw, "_write_account_credentials",
+                         side_effect=backup_write),
+        ):
+            record = sw._fetch_active_usage("1", _email("1"), live_text)
+
+        assert record.error is None and record.sentinel is None, record
+        written = json.loads(live.read_text())
+        assert written["claudeAiOauth"]["refreshToken"] == "fake-login-1-rt-posted"
+        assert written["mcpOAuth"] == mcp_current
+        assert written["designOauth"] == newer
+
+
 @pytest.fixture
 def run_env(linux, temp_home, monkeypatch):
     """Account 1 is the default login with D1; account 2 has no Design login."""

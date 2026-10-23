@@ -38,10 +38,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from claude_swap.fsutil import atomic_write_text
 
 FORCE_ENV = "CLAUDE_CODE_FORCE_WINDOWS_CREDMAN"
 FEATURE_FLAG = "tengu_windows_credman"
@@ -263,16 +264,8 @@ def acknowledge(mode: CredmanMode, ack_file: Path) -> None:
     if not mode.entries:
         return
     acks = {**_read_acks(ack_file), **dict(mode.entries)}
-    tmp = None
     try:
         ack_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=ack_file.parent, suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(acks, f)
-        os.replace(tmp, ack_file)
-        tmp = None
+        atomic_write_text(ack_file, json.dumps(acks))
     except OSError:
         pass
-    finally:
-        if tmp is not None:
-            Path(tmp).unlink(missing_ok=True)
