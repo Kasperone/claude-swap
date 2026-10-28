@@ -26,6 +26,10 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 # The classes under test are shared with the fake-CLI module; only the
 # ``keychain`` fixture below differs.
 from tests.fake_keychain import ACCOUNT, FakeKeychain
+from tests.test_design_oauth_api_key import (  # noqa: F401
+    TestKeyDesignMacOS,
+    TestKeyDesignStoreMacOS,
+)
 from tests.test_design_oauth_macos import (  # noqa: F401
     DESIGN,
     TestAddRemovePurgeOnKeychain,

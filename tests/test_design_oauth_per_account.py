@@ -152,7 +152,7 @@ class TestSwitchMatrix:
         sw.switch_to("2", json_output=True)
         assert _design(live.read_text()) == D2
 
-    def test_api_key_slot_has_none_and_oauth_gets_its_own_back(
+    def test_api_key_slot_keeps_its_own_and_oauth_gets_its_own_back(
         self, linux, temp_home
     ):
         sw = linux
@@ -165,13 +165,17 @@ class TestSwitchMatrix:
         assert sw._read_credentials() == API_KEY
         assert _design(_backup(sw, "1")) == D1
 
-        # /design-login while the key is active: not a login, never the key
-        # slot's, never carried to the next OAuth account.
+        # /design-login while the key is active: not a login, kept with the
+        # key's slot (beside the raw key), never carried to an OAuth account.
         live.write_text(json.dumps({"designOauth": D4}))
         assert sw._read_credentials() == API_KEY
         sw.switch_to("1", json_output=True)
         assert _design(live.read_text()) == D1
         assert sw._read_account_credentials("4", "api-key-4@token.local") == API_KEY
+        assert sw._store.read_key_design("4", "api-key-4@token.local") == (D4, True)
+
+        sw.switch_to("4", json_output=True)
+        assert json.loads(live.read_text()) == {"designOauth": D4}
 
     def test_unreadable_key_never_backs_up_the_login_less_blob(
         self, linux, temp_home, monkeypatch

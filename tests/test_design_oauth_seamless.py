@@ -33,6 +33,7 @@ from tests.claude_code_sim import (
     KeychainStore,
 )
 from tests.test_design_oauth_per_account import (
+    API_KEY,
     _backup,
     _bootstrap,
     _email,
@@ -41,6 +42,9 @@ from tests.test_design_oauth_per_account import (
     _roster,
     linux,  # noqa: F401
 )
+
+
+KEY_EMAIL = "api-key-4@token.local"
 
 
 def _blob(text: str | None) -> dict:
@@ -383,6 +387,82 @@ class SeamlessScenarios:
         sw.switch_to("1", json_output=True)
         assert self.live_store_design(claude) == server.current("1")
         self.assert_seamless(sw, server, claude, "1", None)
+
+    def test_a_k_a_k_with_an_api_key_account(self, sw, world):
+        """The same with an API-key account K in slot 4: A -> K -> A -> K ->
+        B -> K -> A. While K is active, Claude Code keeps K's Design login
+        next to the key (no claude.ai login there) and refreshes it, also
+        during the switch away. Each account, K included, keeps a valid
+        Design login of its own throughout, with one ``/design-login`` each."""
+        server, claude = world
+        sw._store.delete_key_design("4", KEY_EMAIL)  # a real Keychain keeps items
+        sw.add_account_from_token(API_KEY, slot=4)
+        claude.design_login("1")
+        sw.switch_to("4", json_output=True)
+        claude.design_login("4")  # once, while the key is active
+        sw.switch_to("2", json_output=True)
+        claude.design_login("2")
+
+        session_dir = _bootstrap(sw, "3")
+        _identity_file(session_dir, "3")
+        session = FakeClaudeCode(server, self.profile_store(session_dir))
+        session.design_login("3")
+        running = self.live_session(session_dir)
+        try:
+            active = "2"
+            for target in ("4", "1", "4", "2", "4", "1"):
+                if active != "4":  # under a key Claude Code has no login
+                    claude.refresh_login()
+                assert claude.refresh_design() == "saved"
+                session.refresh_login()
+                assert session.refresh_design() == "saved"
+                if active != "4":
+                    self.active_refresh(sw, active, during_post=claude.refresh_design)
+                    assert claude.events[-1] == "saved"
+                for other in ("1", "2"):
+                    if other != active:
+                        assert sw.consume_backup_grant(
+                            other, _email(other), _backup(sw, other)
+                        ).error is None
+
+                assert self.switch_racing_a_design_refresh(sw, claude, target) == (
+                    "saved"
+                )
+                active = target
+                self.assert_key_seamless(sw, server, claude, active, session_dir)
+        finally:
+            running.end()
+
+        sw.switch_to("4", json_output=True)
+        assert self.live_store_design(claude) == server.current("4")
+        assert sw._read_credentials() == API_KEY
+        sw.switch_to("2", json_output=True)
+        assert self.live_store_design(claude) == server.current("2")
+        self.assert_key_seamless(sw, server, claude, "2", None)
+
+    def assert_key_seamless(self, sw, server, claude, active, session_dir) -> None:
+        assert server.revoked == []
+        live = claude.store.read()
+        assert live["designOauth"] == server.current(active)
+        if active == "4":
+            assert sw._read_credentials() == API_KEY
+            assert "claudeAiOauth" not in live
+        else:
+            assert server.is_valid(live["claudeAiOauth"])
+        key_design, readable = sw._store.read_key_design("4", KEY_EMAIL)
+        assert readable
+        assert sw._read_account_credentials("4", KEY_EMAIL) == API_KEY
+        if active != "4":  # the next switch to the key activates this copy
+            assert key_design == server.current("4")
+        for num in ("1", "2"):
+            stored = _blob(_backup(sw, num))
+            assert server.owner(stored.get("designOauth")) == num
+            if num != active:
+                assert stored["designOauth"] == server.current(num)
+                assert server.is_valid(stored["claudeAiOauth"])
+        if session_dir is not None:
+            profile = self.profile_store(session_dir).read()
+            assert profile["designOauth"] == server.current("3")
 
     def assert_seamless(self, sw, server, claude, active, session_dir) -> None:
         # No Design login was ever revoked by a CAS miss, and none is

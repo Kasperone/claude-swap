@@ -1383,7 +1383,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Include full ~/.claude.json in export (default: oauthAccount only)",
+        help=(
+            "Include full ~/.claude.json and full credentials, Claude Design "
+            "logins included, in export (default: oauthAccount and the login only)"
+        ),
     )
     parser.add_argument(
         "--hold",
