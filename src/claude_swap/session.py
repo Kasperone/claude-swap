@@ -197,6 +197,20 @@ AUTH_OVERRIDE_ENV_VARS = (
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 )
 
+# CLAUDE_SECURESTORAGE_CONFIG_DIR, when defined (even empty), moves Claude
+# Code's credential store (file and Keychain item) away from CLAUDE_CONFIG_DIR:
+# exported globally it would point every session at the default store.
+STORAGE_OVERRIDE_ENV_VARS = ("CLAUDE_SECURESTORAGE_CONFIG_DIR",)
+
+
+def _session_env(session_dir: Path) -> dict[str, str]:
+    """Env for claude inside a session profile: the profile's own store only."""
+    dropped = AUTH_OVERRIDE_ENV_VARS + STORAGE_OVERRIDE_ENV_VARS
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
+    env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+    return env
+
+
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
 
@@ -542,10 +556,8 @@ def _mkdir_private(path: Path) -> None:
 
 
 def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
-    env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
-    env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return env
+    """Env for the auth-status probe: the same profile env as the launch."""
+    return _session_env(session_dir)
 
 
 class SessionManager:
@@ -631,6 +643,13 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
+        redirected = [v for v in STORAGE_OVERRIDE_ENV_VARS if v in os.environ]
+        if redirected:
+            warning(
+                f"Ignoring {', '.join(redirected)} for this session — it would "
+                "make the session use another profile's credential store."
+            )
+
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
@@ -639,11 +658,7 @@ class SessionManager:
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
-        env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(claude_bin, claude_args, env=_session_env(session_dir))
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

@@ -594,6 +594,28 @@ def temp_home(tmp_path: Path):
 
 
 @pytest.fixture
+def keychain(tmp_path: Path, monkeypatch):
+    """A fake macOS Keychain: ``macos_keychain`` runs the fake ``security``
+    script (``tests/fake_keychain.py``). Pair with ``no_keychain_fake``."""
+    from tests.fake_keychain import ACCOUNT, FAKE_SECURITY, FakeKeychain
+
+    db = tmp_path / "fake-keychain.json"
+    monkeypatch.setenv("FAKE_SECURITY_DB", str(db))
+    monkeypatch.setenv("USER", ACCOUNT)
+    monkeypatch.setattr(_macos_keychain, "_SECURITY", str(FAKE_SECURITY))
+    return FakeKeychain(db)
+
+
+@pytest.fixture
+def profile(temp_home: Path, monkeypatch) -> Path:
+    """An env-var profile: CLAUDE_CONFIG_DIR points away from ~/.claude."""
+    path = temp_home / "profiles" / "work"
+    path.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(path))
+    return path
+
+
+@pytest.fixture
 def mock_claude_config(temp_home: Path):
     """Create a mock Claude configuration file."""
     config = {

@@ -135,7 +135,8 @@ def _run_command(argv: list[str]) -> None:
         description=(
             "[EXPERIMENTAL] Launch Claude Code as a stored account in this "
             "terminal only (the default login and other terminals are "
-            "unaffected)."
+            "unaffected). The session uses only its own profile's credential "
+            "store; an exported CLAUDE_SECURESTORAGE_CONFIG_DIR is ignored for it."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
