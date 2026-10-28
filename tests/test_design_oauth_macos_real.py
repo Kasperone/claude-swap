@@ -46,6 +46,7 @@ from tests.test_profile_credential_store import (  # noqa: F401
 from tests.test_profile_credential_store import (
     TestEnvVarProfileKeychain as TestStoreEnvVarProfileKeychain,  # noqa: F401
 )
+from tests.test_design_oauth_seamless import TestSeamlessMacOS  # noqa: F401
 
 pytestmark = [
     pytest.mark.no_keychain_fake,

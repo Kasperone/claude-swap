@@ -12,6 +12,7 @@ import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -26,7 +27,12 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth, pace
-from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
+from claude_swap.claude_locks import (
+    claude_config_lock,
+    claude_credentials_lock,
+    claude_store_locks,
+    claude_store_write_lock,
+)
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
@@ -3142,6 +3148,45 @@ class ClaudeAccountSwitcher:
         )
         return True
 
+    def _keep_store_design(self, working: str, start: str | None) -> str:
+        """``working`` as a post-POST write may put it into the live store.
+
+        A cswap refresh renews only the login; Claude Code may have saved a
+        newer Design login (or cleared a dead one) while the POST was in
+        flight. If the store's copy changed since ``start`` was read, it wins,
+        absence included; else the later of the two. ``working`` unchanged
+        when the store cannot be read.
+        """
+        now, readable = self._store.peek_live_design_oauth()
+        if not readable:
+            return working
+        working_design = design_oauth_of(working)
+        if now == design_oauth_of(start):
+            now = newer_design_oauth(now, working_design)
+        return working if now == working_design else with_design_oauth(working, now)
+
+    @contextmanager
+    def _store_write_guard(self):
+        """Claude Code's store write lock, best effort; yields whether it is held.
+
+        For a write that must land even without it (the successor of a
+        consumed grant): a lock not held only means the Design login is
+        merged without that guarantee, never that the write is skipped.
+        Claude Code holds it for a local read-modify-write only, so the wait
+        is short.
+        """
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(claude_store_write_lock(timeout=3.0))
+            except (LockError, OSError) as e:
+                self._logger.warning(
+                    "Claude Code's store write lock is busy (%s); writing "
+                    "the active credential without it.", e,
+                )
+                yield False
+            else:
+                yield True
+
     def _import_keeping_design(
         self, account_num: str, email: str, imported: str
     ) -> str:
@@ -4964,6 +5009,12 @@ class ClaudeAccountSwitcher:
                     # least one of them. Attempt both; tolerate either
                     # failing alone. (For a restore, the backup already holds
                     # it; only the live store needs the write.)
+                    #
+                    # Claude Code may have saved a newer Design login while
+                    # the POST was in flight (its refresh does not take the
+                    # locks held here): keep it, in the backup and again,
+                    # under its store write lock, in the live write itself.
+                    working = self._keep_store_design(working, live)
                     backup_ok = live_ok = True
                     if restore_source is None:
                         try:
@@ -4994,7 +5045,14 @@ class ClaudeAccountSwitcher:
                             live_write = self._prepare_credentials_for_activation(
                                 working, live
                             )
-                        with claude_config_lock():
+                        with (
+                            claude_config_lock(),
+                            self._store_write_guard() as guarded,
+                        ):
+                            if guarded:
+                                live_write = self._keep_store_design(
+                                    live_write, live
+                                )
                             self._write_credentials(live_write)  # active store — CC reads this
                     except Exception:
                         live_ok = False
@@ -7266,9 +7324,17 @@ class ClaudeAccountSwitcher:
         # means a mid-refresh Claude Code either finishes before our swap
         # (backup captures the rotated token) or re-checks after it and aborts.
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
-        # interleaving with Claude Code's own config writes. Everything under
-        # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        # interleaving with Claude Code's own config writes. The store locks
+        # (claude_store_locks) hold off its Design and cloud-sessions refreshes
+        # (whose CAS save revokes a freshly issued token when the store changes
+        # mid-POST) and every other store write. Everything under here is
+        # local I/O — no network while locks are held.
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+            claude_store_locks(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

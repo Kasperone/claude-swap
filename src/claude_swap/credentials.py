@@ -1134,6 +1134,33 @@ class CredentialStore:
             return None
         return shared_credential_fields(text) if is_login_less(text) else None
 
+    def peek_live_design_oauth(self) -> tuple[dict | None, bool]:
+        """The active store's ``designOauth`` and whether it could be read.
+
+        For a caller about to write the store: the active profile's item, then
+        the file (Claude Code's read order), one direct read per item and never
+        through ``_kc_call``, so a transient Keychain failure cannot flip the
+        write that follows to file mode. Unreadable answers ``(None, False)``.
+        """
+        if self._use_keychain():
+            for service in _active_oauth_keychain_services():
+                try:
+                    value = macos_keychain.get_password(
+                        service, macos_keychain.keychain_account_name()
+                    )
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    return None, False
+                if value:
+                    return design_oauth_of(value), True
+        cred_file = get_credentials_path()
+        try:
+            text = cred_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, True
+        except (OSError, ValueError):
+            return None, False
+        return design_oauth_of(text), True
+
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 
