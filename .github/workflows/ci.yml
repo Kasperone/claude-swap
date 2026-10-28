@@ -80,3 +80,32 @@ jobs:
         # that holds under either ordering.
         timeout-minutes: 15
         run: uv run pytest -o faulthandler_timeout=600
+
+      # designOauth against a REAL keychain: a throwaway one with a password
+      # generated per run, fake credentials only. The module skips unless
+      # CSWAP_CI_KEYCHAIN is set, so local runs never touch a keychain.
+      - name: Create temporary keychain
+        run: |
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          echo "::add-mask::$KEYCHAIN_PW"
+          KEYCHAIN="$RUNNER_TEMP/cswap-test.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Search list first, then default: macOS hides a default that is
+          # not in the search list.
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          echo "CSWAP_CI_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          # The tests unlock it again after deliberately locking it.
+          echo "CSWAP_CI_KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
+
+      - name: designOauth against the real Keychain
+        timeout-minutes: 10
+        run: >
+          uv run pytest -o faulthandler_timeout=300 -n 0
+          tests/test_design_oauth_macos_real.py
+
+      - name: Delete temporary keychain
+        if: always()
+        run: security delete-keychain "$CSWAP_CI_KEYCHAIN" || true

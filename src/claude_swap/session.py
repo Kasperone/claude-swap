@@ -49,6 +49,12 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import (
+    design_oauth_of,
+    is_login_less,
+    newer_design_oauth,
+    with_design_oauth,
+)
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
@@ -283,6 +289,35 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         pass  # best-effort; absent entry is already success (rc 44)
 
 
+def read_profile_design(
+    session_dir: Path, strict: bool = False
+) -> tuple[dict | None, bool]:
+    """The profile's ``designOauth`` and whether its store was readable.
+
+    Claude Code's read order: the profile's hashed item(s) first (the first
+    existing one wins over the older plaintext seed), then its file. Raw,
+    unlike :func:`read_config_dir_credentials`: a blob holding only a Design
+    login counts. ``(None, True)`` when there is none, ``(None, False)`` when
+    it could not be read. ``strict`` retries an unreadable Keychain item once,
+    for callers about to delete it.
+    """
+    if Platform.detect() == Platform.MACOS:
+        for service in _keychain_services(str(session_dir)):
+            try:
+                value = _keychain_entry(service, strict=strict)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return None, False
+            if value is not None:
+                return design_oauth_of(value), True
+    try:
+        text = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except (OSError, ValueError):
+        return None, False
+    return design_oauth_of(text), True
+
+
 def read_session_credentials(session_dir: Path) -> str | None:
     """Best-effort read of a session profile's *current* credential JSON.
 
@@ -452,10 +487,13 @@ def read_config_dir_credentials(
                     ) from e
                 break  # best-effort read: the plaintext seed is the next-best truth
             if creds:
-                return creds
+                # Claude Code reads the file only when the item is absent, so a
+                # login-less item (no claude.ai login) shadows it too.
+                return None if is_login_less(creds) else creds
             # entry absent (rc 44) — claude's own signal to look further
     try:
-        return (directory / ".credentials.json").read_text(encoding="utf-8")
+        text = (directory / ".credentials.json").read_text(encoding="utf-8")
+        return None if is_login_less(text) else text
     except (OSError, ValueError):
         # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
         # readable credential material", not an error to propagate.
@@ -803,8 +841,9 @@ class SessionManager:
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
-                self.switcher._invalidate_session_credentials(account_num, email)
-                clear_session_stale(session_dir)
+                # False: not invalidated yet, the marker stays for a later run.
+                if self.switcher._invalidate_session_credentials(account_num, email):
+                    clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
                 # Valid, but possibly not on the generation WE just paid for.
                 # The consume above runs outside this lock (it POSTs), so a
@@ -861,7 +900,7 @@ class SessionManager:
                     f"`claude` is on PATH, then retry."
                 )
             if verdict != "valid":
-                self._cleanup_failed_session(session_dir)
+                self._cleanup_failed_session(session_dir, account_num, email, org_uuid)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "
@@ -898,9 +937,27 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
+        # The profile's Design login may be newer than the backup's: read it
+        # before the delete below. Not from a profile an in-session /login
+        # re-pointed at another account (its Design login is that account's).
+        design, readable = read_profile_design(session_dir, strict=True)
+        profile_design = (
+            None
+            if session_identity_drifted(session_dir, email, org_uuid)
+            else design
+        )
+
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
+        # Never one that could not be read: it may hold the only copy of a
+        # newer Design login. It stays, and the profile is re-seeded later.
+        if readable:
+            delete_macos_keychain_entry(session_dir)
+        else:
+            self._logger.warning(
+                f"Account {account_num}'s session Keychain item could not be "
+                "read; re-seeding without deleting it, and again on a later run"
+            )
 
         creds, unreadable = self.switcher._read_account_credentials_ex(
             account_num, email
@@ -918,6 +975,13 @@ class SessionManager:
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+
+        # Of the backup's and the profile's copy of this account's Design
+        # login, the later wins (the profile's on a tie).
+        backup_design = design_oauth_of(creds)
+        design = newer_design_oauth(profile_design, backup_design)
+        if design != backup_design:
+            creds = with_design_oauth(creds, design)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is
@@ -959,6 +1023,9 @@ class SessionManager:
         existing.setdefault("theme", config_data.get("theme") or "dark")
         atomic_write_text(config_path, json.dumps(existing, indent=2))
 
+        if not readable:
+            mark_session_stale(session_dir)
+
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
@@ -970,7 +1037,14 @@ class SessionManager:
         except (json.JSONDecodeError, AttributeError):
             return True  # unknown shape — let the refresh attempt decide
 
-    def _cleanup_failed_session(self, session_dir: Path) -> None:
+    def _cleanup_failed_session(
+        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+    ) -> None:
+        # The login failed validation, not the Design login: keep a newer one
+        # in the backup first, or keep the profile for a later re-seed.
+        if not self.switcher._keep_session_design(account_num, email, org_uuid):
+            mark_session_stale(session_dir)
+            return
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
         # stale marker is a sibling, so rmtree does not take it.
