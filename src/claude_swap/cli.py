@@ -1380,6 +1380,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--ignore-credman",
+        action="store_true",
+        help=(
+            "With 'switch': switch even if Claude Code looks to be in Windows "
+            "Credential Manager mode, where the switch may not take effect "
+            "(also CSWAP_IGNORE_CREDMAN=1)"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1575,6 +1584,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
+    if args.ignore_credman and not (args.switch or args.switch_to):
+        parser.error("--ignore-credman can only be used with 'switch'")
+
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
@@ -1612,6 +1624,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     payload: dict | None = None
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if args.ignore_credman:
+            switcher.ignore_credman = True
 
         # Check for root (unless in container) - POSIX only
         if sys.platform != "win32":

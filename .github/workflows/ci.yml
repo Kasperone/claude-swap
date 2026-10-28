@@ -46,6 +46,13 @@ jobs:
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest
 
+      - name: Credential Manager detection against the real Credential Manager
+        # CSWAP_CI_CREDMAN lets test_windows_credman create and remove
+        # throwaway entries (fake values) on this runner only.
+        env:
+          CSWAP_CI_CREDMAN: '1'
+        run: uv run pytest -n 0 tests/test_windows_credman.py
+
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the
   # required check.

@@ -47,7 +47,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, spawn
+from claude_swap import macos_keychain, spawn, windows_credman
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -631,6 +631,10 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
+        credman_override = self._refuse_windows_credman(
+            session_dir_for(self.switcher.backup_dir, account_num, email)
+        )
+
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
@@ -643,7 +647,43 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        self.switcher._remember_credman_override(credman_override)
         self._exec(claude_bin, claude_args, env=env)
+
+    def _refuse_windows_credman(
+        self, session_dir: Path
+    ) -> "windows_credman.CredmanMode | None":
+        """Refuse a session while Claude Code may use Windows Credential Manager.
+
+        In that mode Claude Code moves the session's login out of the seeded
+        ``.credentials.json`` on its first refresh, so the slot's backup falls
+        behind for good. Checked: the opt-in env var, the cached flag of the
+        default profile (a rollout reaches every profile) and of the session
+        profile, and an entry for the profile's own service. With
+        ``ignore_credman`` the mode is returned, to be remembered at launch.
+        """
+        sw = self.switcher
+        mode = sw._windows_credman_mode(
+            [], get_default_global_config_path()
+        ) or sw._windows_credman_mode(
+            [keychain_service_name(str(session_dir))],
+            windows_credman.profile_config_path(session_dir),
+        )
+        if mode is None or sw.ignore_credman:
+            return mode
+        stale = (
+            " If that entry is a leftover, running once with the override makes "
+            "cswap accept it until Claude Code writes it again."
+            if mode.entries else ""
+        )
+        raise SessionError(
+            f"{windows_credman.describe(mode)} A session would move its login "
+            "there, out of the profile file cswap seeds and captures, so the "
+            "account's stored backup would fall behind the session's refreshed "
+            "token. cswap does not support Credential Manager and leaves it "
+            "untouched. To run anyway (e.g. after turning the mode off), set "
+            f"{windows_credman.IGNORE_ENV}=1.{stale}"
+        )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, windows_credman
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -47,6 +47,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    _active_oauth_keychain_services,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -318,6 +319,10 @@ class ClaudeAccountSwitcher:
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
+        # Switch even though Claude Code looks to be in Windows Credential
+        # Manager mode (`--ignore-credman`, or CSWAP_IGNORE_CREDMAN=1 for the
+        # TUI/autoswitch). See _refuse_windows_credman.
+        self.ignore_credman = os.environ.get(windows_credman.IGNORE_ENV) == "1"
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
@@ -4468,6 +4473,15 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
+        # Windows Credential Manager mode (see _refuse_windows_credman): the
+        # live login is in Credential Manager, not in the file this path
+        # reads and writes. Seeing no file, it would restore the backup and
+        # POST its grant — which spends the login Claude Code holds there
+        # whenever both are still the same generation. Leave it to Claude
+        # Code, as a switch would.
+        if self._windows_credman_mode() is not None:
+            return _defer(force_refresh)
+
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
         # outright: attributable live → refresh it; unattributable live but
@@ -6134,6 +6148,8 @@ class ClaudeAccountSwitcher:
 
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
+        # Before the auto-add and the usage pass; remembered only on success.
+        self._refuse_windows_credman()
 
         identity = self._get_current_account()
 
@@ -6492,6 +6508,7 @@ class ClaudeAccountSwitcher:
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
+        self._refuse_windows_credman()  # before any prompt
 
         # Ensure org fields are migrated before resolving accounts
         self._get_sequence_data_migrated()
@@ -6967,6 +6984,58 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _refuse_windows_credman(self) -> "windows_credman.CredmanMode | None":
+        """Refuse while Claude Code may keep its login in Windows Credential Manager.
+
+        cswap reads and writes ``.credentials.json``; in Credential Manager
+        mode Claude Code reads its entry there first and deleted that file, so
+        a switch or an add would silently act on a stale or missing login.
+        Detection reads presence and flags only (see :mod:`windows_credman`).
+        With ``ignore_credman`` the mode is returned instead, for
+        :meth:`_remember_credman_override` once the switch has succeeded.
+        """
+        mode = self._windows_credman_mode()
+        if mode is None or self.ignore_credman:
+            return mode
+        stale = (
+            " If that entry is a leftover (the mode was turned off), override "
+            "once: cswap then accepts that entry until Claude Code writes it again."
+            if mode.entries else ""
+        )
+        raise SwitchError(
+            f"{windows_credman.describe(mode)} cswap uses {get_credentials_path()}, "
+            "which Claude Code does not read in that mode, so the switch would "
+            "silently not take effect. cswap does not support Credential Manager "
+            "and leaves it untouched. To go ahead anyway (e.g. after turning the "
+            "mode off), pass --ignore-credman, or set "
+            f"{windows_credman.IGNORE_ENV}=1 (TUI, auto-switch).{stale}"
+        )
+
+    def _windows_credman_mode(
+        self, services: list[str] | None = None, config_path: Path | None = None
+    ) -> "windows_credman.CredmanMode | None":
+        """Claude Code's Credential Manager mode for the active profile (or the
+        one ``services`` / ``config_path`` name); ``None`` off Windows, in
+        plaintext mode, or when it rests only on entries the user overrode
+        before that Claude Code has not written since.
+        """
+        if self.platform != Platform.WINDOWS:
+            return None
+        if services is None:
+            services = _active_oauth_keychain_services()
+        mode = windows_credman.detect(services, config_path)
+        if mode is None:
+            return None
+        acks = self.backup_dir / windows_credman.ACK_FILE
+        return None if windows_credman.acknowledged(mode, acks) else mode
+
+    def _remember_credman_override(
+        self, mode: "windows_credman.CredmanMode | None"
+    ) -> None:
+        """Remember the entries behind an overridden refusal as stale."""
+        if mode is not None:
+            windows_credman.acknowledge(mode, self.backup_dir / windows_credman.ACK_FILE)
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6994,6 +7063,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import scan_live_sessions
 
         self._refuse_session_shell()
+        credman_override = self._refuse_windows_credman()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two
@@ -7297,6 +7367,7 @@ class ClaudeAccountSwitcher:
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
+                self._remember_credman_override(credman_override)
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
@@ -7563,6 +7634,7 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
+        self._remember_credman_override(credman_override)
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
     def _print_switch_followup(self) -> None:
