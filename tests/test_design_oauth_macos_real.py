@@ -33,6 +33,7 @@ from tests.test_design_oauth_macos import (  # noqa: F401
     _login,
 )
 from tests.test_design_oauth_per_account import (  # noqa: F401
+    TestMigrationMacOS,
     TestSessionFreshnessMacOS,
     TestSessionsMacOS,
 )

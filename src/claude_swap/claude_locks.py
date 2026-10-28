@@ -94,22 +94,25 @@ def secure_storage_dir() -> Path:
     return get_credentials_path().parent
 
 
-def credentials_lock_dir() -> Path:
+def credentials_lock_dir(config_home: Path | None = None) -> Path:
     """Legacy credential lock (``~/.claude.lock``) — CC still takes it for
     compatibility; external exclusion today rests on this one. Beside the
     secure-storage dir, like the primary lock (2.1.306/2.1.308:
-    ``${realpath(UL())}.lock``)."""
-    home = secure_storage_dir()
+    ``${realpath(UL())}.lock``). ``config_home`` names another profile's (a
+    ``cswap run`` session) instead of the active one."""
+    home = config_home if config_home is not None else secure_storage_dir()
     return home.parent / (home.name + ".lock")
 
 
-def oauth_refresh_lock_dir() -> Path:
+def oauth_refresh_lock_dir(config_home: Path | None = None) -> Path:
     """Claude Code's primary OAuth refresh lock (2.1.218+).
 
     In the secure-storage dir (2.1.306/2.1.308 take it in ``UL()``, the
     directory of the store the refresh saves to): the config home, unless
-    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` points the store elsewhere."""
-    return secure_storage_dir() / ".oauth_refresh.lock"
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` points the store elsewhere.
+    ``config_home`` names another profile's instead."""
+    home = config_home if config_home is not None else secure_storage_dir()
+    return home / ".oauth_refresh.lock"
 
 
 def config_lock_dir() -> Path:
@@ -223,7 +226,9 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(
+    *, timeout: float | None = None, config_home: Path | None = None
+):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
@@ -232,15 +237,16 @@ def claude_credentials_lock(*, timeout: float | None = None):
     cswap and a waiting Claude Code can never deadlock against each other,
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
+    ``config_home`` names another profile's (a ``cswap run`` session).
     """
     with (
         proper_lockfile(
-            oauth_refresh_lock_dir(),
+            oauth_refresh_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
         proper_lockfile(
-            credentials_lock_dir(),
+            credentials_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
@@ -256,7 +262,9 @@ def claude_config_lock(*, timeout: float | None = None):
 
 
 @contextmanager
-def claude_store_locks(*, timeout: float | None = None):
+def claude_store_locks(
+    storage_dir: Path | None = None, *, timeout: float | None = None
+):
     """Hold Claude Code's account-login refresh locks and its store write lock.
 
     Claude Code (2.1.306, 2.1.308) refreshes ``designOauth`` and
@@ -271,9 +279,10 @@ def claude_store_locks(*, timeout: float | None = None):
 
     Refresh locks first, then the write lock, as Claude Code nests them;
     callers take this after ``claude_credentials_lock`` and
-    ``claude_config_lock``. Local I/O only while held.
+    ``claude_config_lock``. Local I/O only while held. ``storage_dir`` names
+    another profile's store directory (a ``cswap run`` session).
     """
-    base = secure_storage_dir()
+    base = storage_dir if storage_dir is not None else secure_storage_dir()
     with (
         proper_lockfile(
             base / DESIGN_REFRESH_LOCK,
@@ -285,21 +294,24 @@ def claude_store_locks(*, timeout: float | None = None):
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
-        claude_store_write_lock(timeout=timeout),
+        claude_store_write_lock(base, timeout=timeout),
     ):
         yield
 
 
 @contextmanager
-def claude_store_write_lock(*, timeout: float | None = None):
+def claude_store_write_lock(
+    storage_dir: Path | None = None, *, timeout: float | None = None
+):
     """Hold only Claude Code's store write lock (``.storage-write.lock``).
 
     Enough for a write that keeps the store's account-owned sibling logins as
     they are at write time: a refresh Claude Code has in flight then still
     finds the refresh token it POSTed, and its CAS save succeeds afterwards.
     """
+    base = storage_dir if storage_dir is not None else secure_storage_dir()
     with proper_lockfile(
-        secure_storage_dir() / STORE_WRITE_LOCK,
+        base / STORE_WRITE_LOCK,
         timeout=timeout,
         staleness=STORE_WRITE_STALENESS_S,
     ):

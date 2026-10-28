@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import macos_keychain, oauth, transfer
+from claude_swap import macos_keychain, migrations, oauth, transfer
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
 from claude_swap.models import Platform
 from claude_swap.session import keychain_service_name
@@ -263,6 +263,32 @@ class SeamlessScenarios:
         assert stored["claudeAiOauth"] == successor
         assert stored["designOauth"] == design
         assert _design(result.credentials) == design
+
+    def test_running_session_cannot_spend_the_owners_design_login(self, sw, world):
+        """The one-time migration finds account 2's running session holding
+        account 1's Design login (seeded there from another slot). It is
+        removed under that session's own locks, so the session's next Design
+        refresh cannot spend the copy account 1 uses — and no refreshed
+        generation of it can pass for account 2's own later."""
+        server, claude = world
+        d1 = claude.design_login("1")  # live: account 1's
+        session_dir = _bootstrap(sw, "2")
+        _identity_file(session_dir, "2")
+        session = FakeClaudeCode(server, self.profile_store(session_dir))
+        session.mutate(lambda blob: {**blob, "designOauth": d1})  # the old seed
+        running = self.live_session(session_dir)
+        try:
+            assert migrations.migrate_design_oauth_per_account(sw) is True
+            assert session.refresh_design() == "needs_design_login"
+            assert session.store.read()["claudeAiOauth"]  # its login stays
+        finally:
+            running.end()
+
+        assert server.is_valid(d1)
+        assert claude.refresh_design() == "saved"
+        assert server.revoked == []
+        sw._adopt_session_credential("2", _email("2"), "")
+        assert _design(_backup(sw, "2")) is None
 
     def test_import_keeps_the_slots_own_design_login(self, sw, world, tmp_path):
         """A default export carries the login only; importing it over the
