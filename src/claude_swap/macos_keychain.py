@@ -39,6 +39,8 @@ import os
 import re
 import subprocess
 
+from claude_swap import spawn
+
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
 # while leaving any previous entry intact (Claude Code #30337). 64 bytes of
@@ -119,7 +121,7 @@ def get_password(service: str, account: str) -> str | None:
     failure.
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
             capture_output=True,
             text=True,
@@ -152,7 +154,7 @@ def item_exists(service: str, account: str) -> bool:
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,
@@ -178,7 +180,7 @@ def set_password(service: str, account: str, password: str) -> None:
     )
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
+            result = spawn.run(
                 [_SECURITY, "-i"],
                 input=command,
                 capture_output=True,
@@ -189,7 +191,7 @@ def set_password(service: str, account: str, password: str) -> None:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
-            result = subprocess.run(
+            result = spawn.run(
                 [
                     _SECURITY, "add-generic-password", "-U",
                     "-a", account, "-s", service, "-X", hex_value,
@@ -215,7 +217,7 @@ def delete_password(service: str, account: str) -> None:
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,
